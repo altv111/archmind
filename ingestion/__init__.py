@@ -9,7 +9,6 @@ from .dependency_extractor import (
     PythonDependencyExtractor,
 )
 from .repo_loader import SourceFile, iter_repo, iter_repos, load_repos
-from graph.code_graph import CodeGraph, EdgeView, ReverseEdgeView
 from .symbol_extractor import (
     BaseLanguageSymbolExtractor,
     CppSymbolExtractor,
@@ -21,9 +20,6 @@ from .symbol_extractor import (
 
 __all__ = [
     "CodeParser",
-    "CodeGraph",
-    "EdgeView",
-    "ReverseEdgeView",
     "ParsedFile",
     "SourceFile",
     "Containment",

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import json
 from pathlib import Path
 
+from context.context_builder import ContextBuilder
 from graph import GraphBuilder
 from ingestion import (
     CodeParser,
@@ -11,6 +13,7 @@ from ingestion import (
     SymbolExtractor,
     iter_repo,
 )
+from query.query_engine import QueryEngine
 
 
 def run(repo_path: str) -> None:
@@ -121,6 +124,29 @@ def run(repo_path: str) -> None:
         print(f"- dependents_of({name}):")
         for dependent in dependents:
             print(f"  {dependent.name} ({dependent.file}:{dependent.start_line})")
+
+    print("\n== Layer 6: ContextBuilder (GraphBuilder) ==")
+    query = QueryEngine(graph)
+    context_builder = ContextBuilder(query, repo_root=repo_path)
+    focus_symbol = "GraphBuilder"
+    focus_module = query.module_of_symbol(focus_symbol) or "<root>"
+
+    symbol_ctx = context_builder.symbol_context(focus_symbol)
+    class_ctx = context_builder.class_context(focus_symbol)
+    call_chain_ctx = context_builder.call_chain(focus_symbol, depth=2, direction="both")
+    impact_ctx = context_builder.impact_context(focus_symbol, depth=3)
+    module_ctx = context_builder.module_context(focus_module)
+
+    print("\n[symbol_context]")
+    print(json.dumps(symbol_ctx, indent=2))
+    print("\n[class_context]")
+    print(json.dumps(class_ctx, indent=2))
+    print("\n[call_chain]")
+    print(json.dumps(call_chain_ctx, indent=2))
+    print("\n[impact_context]")
+    print(json.dumps(impact_ctx, indent=2))
+    print("\n[module_context]")
+    print(json.dumps(module_ctx, indent=2))
 
 
 def main() -> None:
