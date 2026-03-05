@@ -1,5 +1,6 @@
 from .code_graph import CodeGraph, EdgeView, ReverseEdgeView
 from .code_parser import CodeParser, ParsedFile
+from .containment_extractor import Containment, ContainmentExtractor
 from .dependency_extractor import (
     BaseLanguageDependencyExtractor,
     CppDependencyExtractor,
@@ -25,6 +26,8 @@ __all__ = [
     "ReverseEdgeView",
     "ParsedFile",
     "SourceFile",
+    "Containment",
+    "ContainmentExtractor",
     "Dependency",
     "DependencyExtractor",
     "BaseLanguageDependencyExtractor",

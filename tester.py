@@ -72,7 +72,7 @@ def run(repo_path: str) -> None:
 
     print("\n== Layer 4: Symbol Resolution ==")
     builder = GraphBuilder()
-    build_result = builder.build(symbols, dependencies)
+    build_result = builder.build(symbols, dependencies, repo_root=repo_path)
     resolved = build_result.resolved_dependencies
     resolved_count = sum(1 for dep in resolved if dep.target_symbol_id is not None)
     unresolved_count = len(resolved) - resolved_count
@@ -88,6 +88,12 @@ def run(repo_path: str) -> None:
     graph = build_result.graph
     print(f"Graph nodes: {len(graph.nodes)}")
     print(f"Graph edges: {len(graph.edges)}")
+    print(f"Module edges: {len(build_result.module_edges)}")
+    for module_edge in build_result.module_edges:
+        print(
+            f"- {module_edge.source_module} -> {module_edge.kind} -> "
+            f"{module_edge.target_module}"
+        )
 
     unique_symbol_names: list[str] = []
     seen = set()
