@@ -6,7 +6,7 @@ from typing import Iterable
 
 from graph.module_graph_builder import ModuleDependency, ModuleGraphBuilder
 from graph.symbol_resolver import ResolvedDependency, SymbolResolver
-from ingestion.code_graph import CodeGraph
+from graph.code_graph import CodeGraph
 from ingestion.containment_extractor import ContainmentExtractor
 from ingestion.dependency_extractor import Dependency
 from ingestion.symbol_extractor import Symbol

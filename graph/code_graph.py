@@ -55,6 +55,9 @@ class CodeGraph:
             return [self._symbols_by_id[query]]
         return list(self._symbols_by_name.get(query, []))
 
+    def get_symbol_by_name(self, name: str) -> list[Symbol]:
+        return list(self._symbols_by_name.get(name, []))
+
     def dependencies_of(self, symbol_query: str) -> list[EdgeView]:
         dependencies = self.outgoing_dependencies_of(symbol_query)
         return [
