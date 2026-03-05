@@ -24,6 +24,7 @@ class ParsedFile:
     repo: str
     path: str
     language: str
+    source_bytes: bytes
     ast: Tree
 
 
@@ -39,11 +40,13 @@ class CodeParser:
 
     def parse(self, source_file: SourceFile) -> ParsedFile:
         parser = self._get_parser(source_file.language)
-        ast = parser.parse(source_file.content.encode("utf-8"))
+        source_bytes = source_file.content.encode("utf-8")
+        ast = parser.parse(source_bytes)
         return ParsedFile(
             repo=source_file.repo,
             path=source_file.path,
             language=source_file.language,
+            source_bytes=source_bytes,
             ast=ast,
         )
 
@@ -59,10 +62,33 @@ class CodeParser:
         if parser is not None:
             return parser
 
+        parser = self._get_default_parser(language_name)
+        if parser is not None:
+            self._parser_cache[language_name] = parser
+            return parser
+
         language = self._get_language(language_name)
         parser = Parser()
         self._set_parser_language(parser, language)
         self._parser_cache[language_name] = parser
+        return parser
+
+    def _get_default_parser(self, language_name: str) -> Parser | None:
+        if language_name in self._language_registry or self._language_loader is not None:
+            return None
+
+        try:
+            from tree_sitter_languages import get_parser
+        except ImportError:
+            return None
+
+        try:
+            parser = get_parser(language_name)
+        except Exception:
+            return None
+
+        if parser is None:
+            return None
         return parser
 
     def _get_language(self, language_name: str) -> Language:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -23,6 +24,7 @@ _SKIP_DIRS = {
     "node_modules",
     ".venv",
     "venv",
+    "env",
     "build",
     "dist",
     "target",
@@ -81,11 +83,39 @@ def detect_language(path: Path) -> str:
     return _EXTENSION_LANGUAGE_MAP.get(path.suffix.lower(), "text")
 
 
-def _iter_text_files(repo_root: Path) -> Iterator[Path]:
-    for current_root, dir_names, file_names in repo_root.walk():
-        dir_names[:] = [d for d in dir_names if d not in _SKIP_DIRS]
+def _is_virtualenv_dir(path: Path) -> bool:
+    if (path / "pyvenv.cfg").is_file():
+        return True
+
+    activate = path / "bin" / "activate"
+    if not activate.is_file():
+        return False
+
+    lib_dir = path / "lib"
+    if not lib_dir.is_dir():
+        return False
+
+    for candidate in lib_dir.iterdir():
+        if candidate.is_dir() and candidate.name.startswith("python"):
+            if (candidate / "site-packages").is_dir():
+                return True
+    return False
+
+
+def _iter_text_files(repo_root: Path, skip_dirs: set[str]) -> Iterator[Path]:
+    for current_root, dir_names, file_names in os.walk(repo_root):
+        current_root_path = Path(current_root)
+        filtered: list[str] = []
+        for dir_name in dir_names:
+            if dir_name in skip_dirs:
+                continue
+            if _is_virtualenv_dir(current_root_path / dir_name):
+                continue
+            filtered.append(dir_name)
+        dir_names[:] = filtered
+
         for file_name in file_names:
-            file_path = current_root / file_name
+            file_path = current_root_path / file_name
             if file_path.is_symlink():
                 continue
             yield file_path
@@ -108,13 +138,19 @@ def _read_text(path: Path) -> str | None:
     return None
 
 
-def iter_repo(repo_path: str | Path) -> Iterator[SourceFile]:
+def iter_repo(
+    repo_path: str | Path, skip_dirs: Iterable[str] | None = None
+) -> Iterator[SourceFile]:
     repo_root = Path(repo_path).expanduser().resolve()
     if not repo_root.exists() or not repo_root.is_dir():
         raise ValueError(f"Invalid repository path: {repo_path}")
 
+    effective_skip_dirs = set(_SKIP_DIRS)
+    if skip_dirs:
+        effective_skip_dirs.update(skip_dirs)
+
     repo_name = repo_root.name
-    for file_path in _iter_text_files(repo_root):
+    for file_path in _iter_text_files(repo_root, effective_skip_dirs):
         content = _read_text(file_path)
         if content is None:
             continue
@@ -127,13 +163,21 @@ def iter_repo(repo_path: str | Path) -> Iterator[SourceFile]:
         )
 
 
-def load_repos(repo_paths: str | Path | Iterable[str | Path]) -> list[SourceFile]:
+def iter_repos(
+    repo_paths: str | Path | Iterable[str | Path],
+    skip_dirs: Iterable[str] | None = None,
+) -> Iterator[SourceFile]:
     if isinstance(repo_paths, (str, Path)):
         paths: list[str | Path] = [repo_paths]
     else:
         paths = list(repo_paths)
 
-    loaded_files: list[SourceFile] = []
     for repo_path in paths:
-        loaded_files.extend(iter_repo(repo_path))
-    return loaded_files
+        yield from iter_repo(repo_path, skip_dirs=skip_dirs)
+
+
+def load_repos(
+    repo_paths: str | Path | Iterable[str | Path],
+    skip_dirs: Iterable[str] | None = None,
+) -> list[SourceFile]:
+    return list(iter_repos(repo_paths, skip_dirs=skip_dirs))

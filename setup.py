@@ -8,9 +8,7 @@ setup(
     include_package_data=True,
     python_requires=">=3.10",
     install_requires=[
-        "tree-sitter>=0.25.0",
+        "tree-sitter>=0.21,<0.22",
+        "tree-sitter-languages>=1.10.2,<2.0.0",
     ],
-    extras_require={
-        "grammars": ["tree-sitter-languages>=1.10.2"],
-    },
 )
