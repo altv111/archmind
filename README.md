@@ -182,6 +182,7 @@ Analyze PR risk from local git diff:
 
 ```bash
 archmind pr-risk --base main --head HEAD --store archmind.db --depth 3
+archmind pr-risk --base main --head HEAD --store archmind.db --depth 3 --format full --out pr_risk_full.json
 ```
 
 This maps changed lines to touched symbols, runs per-symbol impact analysis, and returns:
@@ -190,6 +191,8 @@ This maps changed lines to touched symbols, runs per-symbol impact analysis, and
 - aggregated affected symbols/files/repos
 - risk level (`low` / `medium` / `high`)
 - targeted symbol/module contexts for LLM-assisted review.
+
+`--format summary` is the default compact output for terminal use.
 
 Ask a natural-language architecture question:
 

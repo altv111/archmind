@@ -351,6 +351,12 @@ def _add_pr_risk_parser(subparsers: argparse._SubParsersAction) -> None:
         default=3,
         help="How many top affected modules to include module_context for.",
     )
+    parser.add_argument(
+        "--format",
+        choices=["summary", "full"],
+        default="summary",
+        help="Output format: summary (compact) or full (verbose).",
+    )
     parser.add_argument("--out", default=None, help="Optional output JSON path.")
 
 
@@ -796,7 +802,7 @@ def run_pr_risk(args: argparse.Namespace) -> None:
         ),
     }
 
-    result = {
+    full_result = {
         "base": args.base,
         "head": args.head,
         "repo_root": str(Path(args.repo_root).resolve()),
@@ -812,8 +818,40 @@ def run_pr_risk(args: argparse.Namespace) -> None:
         },
     }
 
+    if args.format == "summary":
+        top_risky_symbols = [
+            {
+                "symbol_id": item["symbol"]["symbol_id"],
+                "name": item["symbol"]["name"],
+                "file": item["symbol"]["file"],
+                "risk_score": item["risk_score"],
+                "impacted_symbols": item["summary"]["impacted_symbols"],
+                "direct_callers": item["summary"]["direct_callers"],
+                "direct_callees": item["summary"]["direct_callees"],
+            }
+            for item in per_symbol[:10]
+        ]
+        top_affected_modules = [
+            {"module": module, "hits": hits}
+            for module, hits in sorted(module_hit_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        ]
+        result = {
+            "base": args.base,
+            "head": args.head,
+            "repo_root": str(Path(args.repo_root).resolve()),
+            "summary": summary,
+            "changed_files": sorted(changed_lines),
+            "top_risky_symbols": top_risky_symbols,
+            "top_affected_modules": top_affected_modules,
+            "top_context_symbols": [item["symbol_id"] for item in symbol_contexts],
+            "top_context_modules": [item["module"] for item in module_contexts],
+        }
+    else:
+        result = full_result
+
     envelope = {
         "run_id": loaded.run_id,
+        "format": args.format,
         "result": result,
     }
     content = json.dumps(_json_ready(envelope), indent=2)
