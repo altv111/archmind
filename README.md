@@ -182,11 +182,18 @@ Use Ollama for final answer generation:
 
 ```bash
 archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama
+archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama --llm-timeout 900
+archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama --stream
 ```
 
 `--source` options:
 - `archmind` (default): heuristic planning + structured context only (no LLM answer).
 - `ollama` (or alias `ollamal`): uses Ollama for intent detection and symbol/module extraction during planning, and generates final `llm_answer`.
+
+`ask` progress and latency controls:
+- progress updates (intent/focus symbol/module) are printed to stderr while the query runs.
+- `--llm-timeout <seconds>` increases HTTP timeout for slower local models.
+- `--stream` streams final Ollama answer tokens to stderr while generation is in progress.
 
 Generate context from SQLite:
 

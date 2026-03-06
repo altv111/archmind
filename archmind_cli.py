@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sys
 from typing import Iterable
 
 
@@ -252,6 +253,17 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
         "--host",
         default="http://127.0.0.1:11434",
         help="Ollama host when --source is ollama/ollamal.",
+    )
+    parser.add_argument(
+        "--llm-timeout",
+        type=int,
+        default=600,
+        help="LLM HTTP timeout in seconds (default: 600).",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream final Ollama answer tokens to stderr while generating.",
     )
 
 
@@ -532,10 +544,58 @@ def run_ask(args: argparse.Namespace) -> None:
     loaded = GraphLoader(args.store).load(run_id=args.run_id)
     query = QueryEngine(loaded.graph, repo_root=args.repo_root)
     context_builder = ContextBuilder(query)
-    llm = _build_llm(args.source, model=args.model, host=args.host)
+    llm = _build_llm(
+        args.source,
+        model=args.model,
+        host=args.host,
+        timeout=args.llm_timeout,
+    )
     orchestrator = QueryOrchestrator(query, context_builder, llm=llm)
 
-    payload = orchestrator.run(args.question)
+    print("[ask] planning query...", file=sys.stderr)
+    plan = orchestrator.planner.plan(args.question)
+    print(f"[ask] intent: {plan.get('intent')}", file=sys.stderr)
+    if "focus_symbol" in plan:
+        print(f"[ask] focus_symbol: {plan['focus_symbol']}", file=sys.stderr)
+    if "focus_module" in plan:
+        print(f"[ask] focus_module: {plan['focus_module']}", file=sys.stderr)
+
+    print("[ask] executing plan...", file=sys.stderr)
+    results = orchestrator.executor.execute(plan)
+
+    print("[ask] building context...", file=sys.stderr)
+    context = orchestrator._build_context(plan)
+
+    payload = {
+        "question": args.question,
+        "plan": plan,
+        "results": results,
+        "context": context,
+    }
+
+    if llm and hasattr(llm, "answer"):
+        print("[ask] generating LLM answer...", file=sys.stderr)
+        if args.stream and args.source in {"ollama", "ollamal"}:
+            print("[ask] streaming answer:", file=sys.stderr)
+
+            def _on_token(token: str) -> None:
+                print(token, end="", file=sys.stderr, flush=True)
+
+            payload["llm_answer"] = llm.answer(
+                args.question,
+                context,
+                timeout=args.llm_timeout,
+                stream=True,
+                on_token=_on_token,
+            )
+            print("", file=sys.stderr)
+        else:
+            payload["llm_answer"] = llm.answer(
+                args.question,
+                context,
+                timeout=args.llm_timeout,
+            )
+
     envelope = {
         "run_id": loaded.run_id,
         "question": args.question,
@@ -549,7 +609,7 @@ def run_ask(args: argparse.Namespace) -> None:
     print(content)
 
 
-def _build_llm(source: str, model: str, host: str):
+def _build_llm(source: str, model: str, host: str, timeout: int):
     if source in {"ollama", "ollamal"}:
         try:
             from llm.ollama_client import OllamaLLM
@@ -568,7 +628,7 @@ def _build_llm(source: str, model: str, host: str):
             spec.loader.exec_module(module)
             OllamaLLM = module.OllamaLLM
 
-        return OllamaLLM(model=model, host=host)
+        return OllamaLLM(model=model, host=host, timeout=timeout)
     return None
 
 

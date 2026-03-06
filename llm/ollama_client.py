@@ -9,26 +9,64 @@ class OllamaLLM:
         self,
         model: str = "llama3:8b",
         host: str = "http://127.0.0.1:11434",
+        timeout: int = 600,
     ) -> None:
         self.model = model
         self.url = f"{host}/api/generate"
+        self.timeout = timeout
 
-    def generate(self, prompt: str, temperature: float = 0.2) -> str:
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.2,
+        timeout: int | None = None,
+        stream: bool = False,
+        on_token=None,
+    ) -> str:
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": stream,
             "options": {
                 "temperature": temperature,
             },
         }
 
-        response = requests.post(self.url, json=payload, timeout=120)
+        effective_timeout = timeout if timeout is not None else self.timeout
+        response = requests.post(self.url, json=payload, timeout=effective_timeout, stream=stream)
         response.raise_for_status()
-        data = response.json()
-        return data["response"]
 
-    def answer(self, question: str, context: dict, temperature: float = 0.2) -> str:
+        if not stream:
+            data = response.json()
+            return data["response"]
+
+        chunks: list[str] = []
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            token = event.get("response")
+            if token:
+                token_text = str(token)
+                chunks.append(token_text)
+                if on_token is not None:
+                    on_token(token_text)
+            if event.get("done"):
+                break
+        return "".join(chunks)
+
+    def answer(
+        self,
+        question: str,
+        context: dict,
+        temperature: float = 0.2,
+        timeout: int | None = None,
+        stream: bool = False,
+        on_token=None,
+    ) -> str:
         prompt = (
             "You are an architecture assistant. Use the provided structured context to answer "
             "the user question clearly and concisely.\n\n"
@@ -37,7 +75,13 @@ class OllamaLLM:
             f"{json.dumps(context, indent=2)}\n\n"
             "Answer:"
         )
-        return self.generate(prompt=prompt, temperature=temperature)
+        return self.generate(
+            prompt=prompt,
+            temperature=temperature,
+            timeout=timeout,
+            stream=stream,
+            on_token=on_token,
+        )
 
     def detect_intent(self, question: str) -> str:
         prompt = (
