@@ -134,7 +134,57 @@ class IndexStore:
             CREATE INDEX IF NOT EXISTS idx_module_edges_tgt ON module_edges(target_module);
             """
         )
+        self._migrate_symbols_schema_if_needed()
         self.conn.commit()
+
+    def _migrate_symbols_schema_if_needed(self) -> None:
+        """
+        Ensure symbols are unique per run, not globally by symbol_id.
+        Older schemas used `symbol_id` as PRIMARY KEY, which breaks re-index
+        across runs for unchanged files/symbol IDs.
+        """
+        columns = self.conn.execute("PRAGMA table_info(symbols)").fetchall()
+        if not columns:
+            return
+
+        # New schema should have a composite primary key:
+        # PRIMARY KEY (run_id, symbol_id)
+        pk_by_name = {str(row["name"]): int(row["pk"]) for row in columns}
+        is_new_schema = pk_by_name.get("run_id") == 1 and pk_by_name.get("symbol_id") == 2
+        if is_new_schema:
+            return
+
+        self.conn.executescript(
+            """
+            ALTER TABLE symbols RENAME TO symbols_old;
+
+            CREATE TABLE symbols (
+                run_id INTEGER NOT NULL,
+                symbol_id TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                file TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                parent_symbol_id TEXT,
+                PRIMARY KEY (run_id, symbol_id),
+                FOREIGN KEY(run_id) REFERENCES index_runs(run_id) ON DELETE CASCADE
+            );
+
+            INSERT OR REPLACE INTO symbols (
+                run_id, symbol_id, repo, file, name, kind, start_line, end_line, parent_symbol_id
+            )
+            SELECT
+                run_id, symbol_id, repo, file, name, kind, start_line, end_line, parent_symbol_id
+            FROM symbols_old;
+
+            DROP TABLE symbols_old;
+
+            CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
+            CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+            """
+        )
 
     def start_run(self, commit: str | None = None, notes: str | None = None) -> IndexRun:
         now = _utc_now()
