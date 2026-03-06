@@ -178,6 +178,16 @@ archmind ask --question "Explain GraphBuilder" --store archmind.db
 archmind ask --question "Show architecture for module graph" --store archmind.db
 ```
 
+Use Ollama for final answer generation:
+
+```bash
+archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama
+```
+
+`--source` options:
+- `archmind` (default): heuristic planning + structured context only (no LLM answer).
+- `ollama` (or alias `ollamal`): uses Ollama for intent detection and symbol/module extraction during planning, and generates final `llm_answer`.
+
 Generate context from SQLite:
 
 ```bash

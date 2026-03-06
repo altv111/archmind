@@ -20,7 +20,8 @@ def main() -> None:
             "  archmind index --repo /repos/serviceA\n"
             "  archmind reset_store --store archmind.db\n"
             "  archmind explain-symbol GraphBuilder --store archmind.db\n"
-            "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db"
+            "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db\n"
+            "  archmind ask --question \"Explain GraphBuilder\" --store archmind.db --source ollama"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -235,6 +236,22 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
         "--out",
         default=None,
         help="Optional output JSON path.",
+    )
+    parser.add_argument(
+        "--source",
+        default="archmind",
+        choices=["archmind", "ollama", "ollamal"],
+        help="Answer source: heuristic-only archmind mode, or Ollama-backed answer generation.",
+    )
+    parser.add_argument(
+        "--model",
+        default="llama3:8b",
+        help="LLM model name when --source is ollama/ollamal.",
+    )
+    parser.add_argument(
+        "--host",
+        default="http://127.0.0.1:11434",
+        help="Ollama host when --source is ollama/ollamal.",
     )
 
 
@@ -515,7 +532,8 @@ def run_ask(args: argparse.Namespace) -> None:
     loaded = GraphLoader(args.store).load(run_id=args.run_id)
     query = QueryEngine(loaded.graph, repo_root=args.repo_root)
     context_builder = ContextBuilder(query)
-    orchestrator = QueryOrchestrator(query, context_builder)
+    llm = _build_llm(args.source, model=args.model, host=args.host)
+    orchestrator = QueryOrchestrator(query, context_builder, llm=llm)
 
     payload = orchestrator.run(args.question)
     envelope = {
@@ -529,6 +547,29 @@ def run_ask(args: argparse.Namespace) -> None:
         print(f"Wrote ask result to: {args.out}")
         return
     print(content)
+
+
+def _build_llm(source: str, model: str, host: str):
+    if source in {"ollama", "ollamal"}:
+        try:
+            from llm.ollama_client import OllamaLLM
+        except ModuleNotFoundError:
+            # Fallback for environments where entrypoint metadata is stale and
+            # new package paths are not yet visible to the installed CLI.
+            import importlib.util
+            import sys
+
+            module_path = Path(__file__).resolve().parent / "llm" / "ollama_client.py"
+            spec = importlib.util.spec_from_file_location("ollama_client", module_path)
+            if spec is None or spec.loader is None:
+                raise
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["ollama_client"] = module
+            spec.loader.exec_module(module)
+            OllamaLLM = module.OllamaLLM
+
+        return OllamaLLM(model=model, host=host)
+    return None
 
 
 def _collect_component_dependencies(query, symbol) -> list[str]:
