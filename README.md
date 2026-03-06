@@ -162,6 +162,14 @@ archmind query --store archmind.db --mode dependencies --symbol GraphBuilder
 archmind query --store archmind.db --mode module_dependencies --module graph
 ```
 
+Explain a symbol quickly:
+
+```bash
+archmind explain-symbol GraphBuilder
+```
+
+`explain-symbol` uses `archmind.db` by default; pass `--store <path>` to override.
+
 Generate context from SQLite:
 
 ```bash

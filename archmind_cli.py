@@ -17,7 +17,8 @@ def main() -> None:
             "  archmind index --repo-list repo_list --store archmind.db\n"
             "  archmind update --repo /repos/serviceA --repo /repos/common-lib --store archmind.db\n"
             "  archmind index --repo /repos/serviceA\n"
-            "  archmind reset_store --store archmind.db"
+            "  archmind reset_store --store archmind.db\n"
+            "  archmind explain-symbol GraphBuilder --store archmind.db"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -31,6 +32,7 @@ def main() -> None:
     _add_store_reset_parser(subparsers, "reset_store", "Reset (wipe) stored index data.")
     _add_query_parser(subparsers)
     _add_generate_context_parser(subparsers)
+    _add_explain_symbol_parser(subparsers)
 
     args = parser.parse_args()
     command = args.command
@@ -46,6 +48,9 @@ def main() -> None:
         return
     if command == "generate_context":
         run_generate_context(args)
+        return
+    if command == "explain-symbol":
+        run_explain_symbol(args)
         return
 
     repo_paths = _resolve_repo_paths(args.repo, args.repo_list)
@@ -177,6 +182,21 @@ def _add_generate_context_parser(subparsers: argparse._SubParsersAction) -> None
         default=200,
         help="Maximum symbols to include for batch generation.",
     )
+
+
+def _add_explain_symbol_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "explain-symbol",
+        help="Print a concise symbol summary (methods, dependencies, callers).",
+    )
+    parser.add_argument("symbol", help="Symbol name or symbol_id.")
+    parser.add_argument(
+        "--store",
+        default="archmind.db",
+        help="SQLite database path (default: archmind.db).",
+    )
+    parser.add_argument("--run-id", type=int, default=None, help="Run ID to load (default: latest completed).")
+    parser.add_argument("--repo-root", default=None, help="Optional repo root for source lookups.")
 
 
 def _resolve_repo_paths(repo_args: list[str], repo_list_path: str | None) -> list[Path]:
@@ -398,6 +418,107 @@ def run_generate_context(args: argparse.Namespace) -> None:
         print(f"Wrote context to: {args.out}")
     else:
         print(content)
+
+
+def run_explain_symbol(args: argparse.Namespace) -> None:
+    from query.query_engine import QueryEngine
+    from storage import GraphLoader
+
+    loaded = GraphLoader(args.store).load(run_id=args.run_id)
+    query = QueryEngine(loaded.graph, repo_root=args.repo_root)
+
+    matches = query.resolve_symbols(args.symbol)
+    if not matches:
+        raise SystemExit(f"Symbol not found: {args.symbol}")
+
+    symbol = matches[0]
+    methods = [
+        child
+        for child in query.children_of(symbol.symbol_id)
+        if child.kind in {"method", "function"}
+    ]
+
+    dependency_names = _collect_component_dependencies(query, symbol)
+    caller_names = _collect_component_callers(query, symbol)
+
+    print(symbol.name)
+    print("-" * len(symbol.name))
+    print(f"file: {symbol.file}")
+    print(f"kind: {symbol.kind}")
+    print("")
+    print("Methods:")
+    if methods:
+        for method in sorted({m.name for m in methods}):
+            print(f" - {method}")
+    else:
+        print(" - (none)")
+    print("")
+    print("Dependencies:")
+    if dependency_names:
+        for name in dependency_names:
+            print(f" - {name}")
+    else:
+        print(" - (none)")
+    print("")
+    print("Called By:")
+    if caller_names:
+        for name in caller_names:
+            print(f" - {name}")
+    else:
+        print(" - (none)")
+
+
+def _collect_component_dependencies(query, symbol) -> list[str]:
+    names: set[str] = set()
+    scope_ids = [symbol.symbol_id] + [child.symbol_id for child in query.children_of(symbol.symbol_id)]
+    for symbol_id in scope_ids:
+        for dep in query.dependency_edges_of(symbol_id):
+            if dep.kind not in {"calls", "imports", "inherits"}:
+                continue
+            component = _component_name(query, dep.target)
+            if not component:
+                continue
+            if component == symbol.name:
+                continue
+            names.add(component)
+    return sorted(names)
+
+
+def _collect_component_callers(query, symbol) -> list[str]:
+    names: set[str] = set()
+    scope_ids = [symbol.symbol_id] + [child.symbol_id for child in query.children_of(symbol.symbol_id)]
+    for symbol_id in scope_ids:
+        for dep in query.dependent_edges_of(symbol_id, kind="calls"):
+            component = _component_name(query, dep.source)
+            if not component:
+                continue
+            if component == symbol.name:
+                continue
+            names.add(component)
+    return sorted(names)
+
+
+def _component_name(query, symbol) -> str | None:
+    if symbol.kind == "external":
+        if "." in symbol.name:
+            receiver = symbol.name.split(".", 1)[0]
+            if receiver and receiver[0].isalpha() and receiver[0].isupper():
+                return receiver
+            return None
+        if symbol.name and symbol.name[0].isalpha() and symbol.name[0].isupper():
+            return symbol.name
+        return None
+
+    current = symbol
+    while current.parent:
+        parent = query.resolve_symbol(current.parent)
+        if parent is None:
+            break
+        if parent.kind in {"class", "module", "namespace"}:
+            current = parent
+            break
+        current = parent
+    return current.name
 
 
 def asdict_symbol(symbol) -> dict | None:

@@ -1,4 +1,10 @@
-from .code_parser import CodeParser, ParsedFile
+try:
+    # Keep DB-only commands usable even if parser runtime deps (tree_sitter)
+    # are not installed in the active environment.
+    from .code_parser import CodeParser, ParsedFile
+except ImportError:  # pragma: no cover - runtime environment dependent
+    CodeParser = None  # type: ignore[assignment]
+    ParsedFile = None  # type: ignore[assignment]
 from .containment_extractor import Containment, ContainmentExtractor
 from .dependency_extractor import (
     BaseLanguageDependencyExtractor,

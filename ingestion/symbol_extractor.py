@@ -4,11 +4,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable
 
-from ingestion.code_parser import ParsedFile
-
 if TYPE_CHECKING:
+    from ingestion.code_parser import ParsedFile
     from tree_sitter import Node
 else:
+    ParsedFile = Any
     Node = Any
 
 
