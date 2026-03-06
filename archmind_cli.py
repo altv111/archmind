@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import is_dataclass
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
@@ -18,7 +19,8 @@ def main() -> None:
             "  archmind update --repo /repos/serviceA --repo /repos/common-lib --store archmind.db\n"
             "  archmind index --repo /repos/serviceA\n"
             "  archmind reset_store --store archmind.db\n"
-            "  archmind explain-symbol GraphBuilder --store archmind.db"
+            "  archmind explain-symbol GraphBuilder --store archmind.db\n"
+            "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -33,6 +35,7 @@ def main() -> None:
     _add_query_parser(subparsers)
     _add_generate_context_parser(subparsers)
     _add_explain_symbol_parser(subparsers)
+    _add_ask_parser(subparsers)
 
     args = parser.parse_args()
     command = args.command
@@ -51,6 +54,9 @@ def main() -> None:
         return
     if command == "explain-symbol":
         run_explain_symbol(args)
+        return
+    if command == "ask":
+        run_ask(args)
         return
 
     repo_paths = _resolve_repo_paths(args.repo, args.repo_list)
@@ -197,6 +203,39 @@ def _add_explain_symbol_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--run-id", type=int, default=None, help="Run ID to load (default: latest completed).")
     parser.add_argument("--repo-root", default=None, help="Optional repo root for source lookups.")
+
+
+def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "ask",
+        help="Run natural-language query planning/execution on SQLite-backed graph.",
+    )
+    parser.add_argument(
+        "--question",
+        required=True,
+        help="Natural language question.",
+    )
+    parser.add_argument(
+        "--store",
+        default="archmind.db",
+        help="SQLite database path (default: archmind.db).",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=int,
+        default=None,
+        help="Run ID to load (default: latest completed).",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Optional repo root for richer source snippets in contexts.",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional output JSON path.",
+    )
 
 
 def _resolve_repo_paths(repo_args: list[str], repo_list_path: str | None) -> list[Path]:
@@ -468,6 +507,30 @@ def run_explain_symbol(args: argparse.Namespace) -> None:
         print(" - (none)")
 
 
+def run_ask(args: argparse.Namespace) -> None:
+    from context.context_builder import ContextBuilder
+    from query import QueryEngine, QueryOrchestrator
+    from storage import GraphLoader
+
+    loaded = GraphLoader(args.store).load(run_id=args.run_id)
+    query = QueryEngine(loaded.graph, repo_root=args.repo_root)
+    context_builder = ContextBuilder(query)
+    orchestrator = QueryOrchestrator(query, context_builder)
+
+    payload = orchestrator.run(args.question)
+    envelope = {
+        "run_id": loaded.run_id,
+        "question": args.question,
+        "result": _json_ready(payload),
+    }
+    content = json.dumps(envelope, indent=2)
+    if args.out:
+        Path(args.out).write_text(content, encoding="utf-8")
+        print(f"Wrote ask result to: {args.out}")
+        return
+    print(content)
+
+
 def _collect_component_dependencies(query, symbol) -> list[str]:
     names: set[str] = set()
     scope_ids = [symbol.symbol_id] + [child.symbol_id for child in query.children_of(symbol.symbol_id)]
@@ -679,6 +742,16 @@ def _safe_filename(value: str) -> str:
         else:
             cleaned.append("_")
     return "".join(cleaned)[:180]
+
+
+def _json_ready(value):
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    return value
 
 
 def write_local_artifacts(result: dict, output_root: str) -> Path:

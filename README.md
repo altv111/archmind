@@ -170,6 +170,14 @@ archmind explain-symbol GraphBuilder
 
 `explain-symbol` uses `archmind.db` by default; pass `--store <path>` to override.
 
+Ask a natural-language architecture question:
+
+```bash
+archmind ask --question "What is the impact if GraphBuilder changes?" --store archmind.db
+archmind ask --question "Explain GraphBuilder" --store archmind.db
+archmind ask --question "Show architecture for module graph" --store archmind.db
+```
+
 Generate context from SQLite:
 
 ```bash
