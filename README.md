@@ -178,6 +178,19 @@ archmind impact --symbol GraphBuilder --store archmind.db --depth 3
 
 This returns impacted symbols by level, affected files/repos, direct callees, and an impact context payload.
 
+Analyze PR risk from local git diff:
+
+```bash
+archmind pr-risk --base main --head HEAD --store archmind.db --depth 3
+```
+
+This maps changed lines to touched symbols, runs per-symbol impact analysis, and returns:
+- touched symbols
+- per-symbol impact summaries and call chains
+- aggregated affected symbols/files/repos
+- risk level (`low` / `medium` / `high`)
+- targeted symbol/module contexts for LLM-assisted review.
+
 Ask a natural-language architecture question:
 
 ```bash

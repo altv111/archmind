@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from dataclasses import is_dataclass
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
+import subprocess
 import sys
 from typing import Iterable
 
@@ -22,6 +25,7 @@ def main() -> None:
             "  archmind reset_store --store archmind.db\n"
             "  archmind explain-symbol GraphBuilder --store archmind.db\n"
             "  archmind impact --symbol GraphBuilder --store archmind.db --depth 3\n"
+            "  archmind pr-risk --base main --head HEAD --store archmind.db\n"
             "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db\n"
             "  archmind ask --question \"Explain GraphBuilder\" --store archmind.db --source ollama"
         ),
@@ -39,6 +43,7 @@ def main() -> None:
     _add_generate_context_parser(subparsers)
     _add_explain_symbol_parser(subparsers)
     _add_impact_parser(subparsers)
+    _add_pr_risk_parser(subparsers)
     _add_ask_parser(subparsers)
 
     args = parser.parse_args()
@@ -64,6 +69,9 @@ def main() -> None:
         return
     if command == "impact":
         run_impact(args)
+        return
+    if command == "pr-risk":
+        run_pr_risk(args)
         return
 
     repo_paths = _resolve_repo_paths(args.repo, args.repo_list)
@@ -309,6 +317,41 @@ def _add_impact_parser(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help="Optional output JSON path.",
     )
+
+
+def _add_pr_risk_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "pr-risk",
+        help="Analyze local PR diff risk by mapping changed lines to symbols and impact.",
+    )
+    parser.add_argument("--store", default="archmind.db", help="SQLite database path (default: archmind.db).")
+    parser.add_argument("--run-id", type=int, default=None, help="Run ID to load (default: latest completed).")
+    parser.add_argument("--base", default="main", help="Base git ref for diff (default: main).")
+    parser.add_argument("--head", default="HEAD", help="Head git ref for diff (default: HEAD).")
+    parser.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root to run git diff from (default: current directory).",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        help="Caller traversal depth for impact propagation.",
+    )
+    parser.add_argument(
+        "--top-symbol-contexts",
+        type=int,
+        default=5,
+        help="How many top touched symbols to include symbol_context for.",
+    )
+    parser.add_argument(
+        "--top-module-contexts",
+        type=int,
+        default=3,
+        help="How many top affected modules to include module_context for.",
+    )
+    parser.add_argument("--out", default=None, help="Optional output JSON path.")
 
 
 def _resolve_repo_paths(repo_args: list[str], repo_list_path: str | None) -> list[Path]:
@@ -648,6 +691,206 @@ def run_impact(args: argparse.Namespace) -> None:
         print(f"Wrote impact analysis to: {args.out}")
         return
     print(content)
+
+
+def run_pr_risk(args: argparse.Namespace) -> None:
+    from context.context_builder import ContextBuilder
+    from query import QueryEngine
+    from storage import GraphLoader
+
+    loaded = GraphLoader(args.store).load(run_id=args.run_id)
+    query = QueryEngine(loaded.graph, repo_root=args.repo_root)
+    context_builder = ContextBuilder(query)
+
+    changed_lines = _git_changed_lines(repo_root=args.repo_root, base=args.base, head=args.head)
+    touched_symbols = _symbols_touched_by_diff(query, changed_lines)
+
+    per_symbol: list[dict] = []
+    affected_symbol_ids: set[str] = set()
+    affected_files: set[str] = set()
+    affected_repos: set[str] = set()
+    module_hit_counts: dict[str, int] = defaultdict(int)
+
+    for symbol in touched_symbols:
+        impacted_by_level = query.impact_by_level(symbol.symbol_id, depth=args.depth)
+        call_chain = query.call_chain(symbol.symbol_id, depth=2, direction="both")
+        impacted_flat = []
+        seen_local: set[str] = set()
+        for _, symbols in sorted(impacted_by_level.items()):
+            for impacted in symbols:
+                if impacted.symbol_id in seen_local:
+                    continue
+                seen_local.add(impacted.symbol_id)
+                impacted_flat.append(impacted)
+
+        total_impacted = len(impacted_flat)
+        direct_callers = len(query.callers_of(symbol.symbol_id))
+        direct_callees = len(query.callees_of(symbol.symbol_id))
+        risk_score = total_impacted * 2 + direct_callers + direct_callees
+
+        for item in [symbol] + impacted_flat:
+            affected_symbol_ids.add(item.symbol_id)
+            if item.file:
+                affected_files.add(item.file)
+                module = query.module_of_symbol(item.symbol_id)
+                if module:
+                    module_hit_counts[module] += 1
+            if item.repo:
+                affected_repos.add(item.repo)
+
+        per_symbol.append(
+            {
+                "symbol": asdict_symbol(symbol),
+                "risk_score": risk_score,
+                "summary": {
+                    "impacted_symbols": total_impacted,
+                    "direct_callers": direct_callers,
+                    "direct_callees": direct_callees,
+                },
+                "impacted_by_level": {
+                    str(level): [asdict_symbol(s) for s in symbols]
+                    for level, symbols in sorted(impacted_by_level.items())
+                },
+                "call_chain": call_chain,
+            }
+        )
+
+    per_symbol.sort(key=lambda item: item["risk_score"], reverse=True)
+    top_touched = per_symbol[: args.top_symbol_contexts]
+
+    top_modules = [
+        module for module, _ in sorted(module_hit_counts.items(), key=lambda kv: kv[1], reverse=True)
+    ][: args.top_module_contexts]
+
+    symbol_contexts = []
+    for item in top_touched:
+        symbol_id = item["symbol"]["symbol_id"]
+        symbol_contexts.append(
+            {
+                "symbol_id": symbol_id,
+                "context": context_builder.symbol_context(symbol_id),
+            }
+        )
+
+    module_contexts = []
+    for module in top_modules:
+        module_contexts.append(
+            {
+                "module": module,
+                "context": context_builder.module_context(module),
+            }
+        )
+
+    summary = {
+        "changed_files": len(changed_lines),
+        "touched_symbols": len(touched_symbols),
+        "affected_symbols": len(affected_symbol_ids),
+        "affected_files": len(affected_files),
+        "affected_repos": len(affected_repos),
+        "cross_repo": len(affected_repos) > 1,
+        "risk_level": _pr_risk_level(
+            touched_symbols=len(touched_symbols),
+            affected_symbols=len(affected_symbol_ids),
+            affected_repos=len(affected_repos),
+            top_score=per_symbol[0]["risk_score"] if per_symbol else 0,
+        ),
+    }
+
+    result = {
+        "base": args.base,
+        "head": args.head,
+        "repo_root": str(Path(args.repo_root).resolve()),
+        "summary": summary,
+        "changed_files": {
+            file: sorted(lines) for file, lines in sorted(changed_lines.items())
+        },
+        "touched_symbols": [asdict_symbol(s) for s in touched_symbols],
+        "symbol_impacts": per_symbol,
+        "contexts": {
+            "top_symbol_contexts": symbol_contexts,
+            "top_module_contexts": module_contexts,
+        },
+    }
+
+    envelope = {
+        "run_id": loaded.run_id,
+        "result": result,
+    }
+    content = json.dumps(_json_ready(envelope), indent=2)
+    if args.out:
+        Path(args.out).write_text(content, encoding="utf-8")
+        print(f"Wrote PR risk analysis to: {args.out}")
+        return
+    print(content)
+
+
+def _git_changed_lines(*, repo_root: str, base: str, head: str) -> dict[str, set[int]]:
+    cmd = [
+        "git",
+        "-C",
+        str(Path(repo_root).resolve()),
+        "diff",
+        "--unified=0",
+        "--no-color",
+        f"{base}...{head}",
+    ]
+    try:
+        diff_text = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"git diff failed: {exc.output.strip()}")
+
+    changed: dict[str, set[int]] = defaultdict(set)
+    current_file: str | None = None
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line[4:].strip()
+            if raw == "/dev/null":
+                current_file = None
+            elif raw.startswith("b/"):
+                current_file = raw[2:]
+            else:
+                current_file = raw
+            continue
+
+        if current_file is None:
+            continue
+
+        match = hunk_re.match(line)
+        if not match:
+            continue
+
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+        if count <= 0:
+            changed[current_file].add(start)
+            continue
+        for lineno in range(start, start + count):
+            changed[current_file].add(lineno)
+
+    return changed
+
+
+def _symbols_touched_by_diff(query, changed_lines: dict[str, set[int]]) -> list:
+    touched = []
+    for symbol in query.all_symbols():
+        lines = changed_lines.get(symbol.file)
+        if not lines:
+            continue
+        if any(symbol.start_line <= line <= symbol.end_line for line in lines):
+            touched.append(symbol)
+    # stable order for deterministic output
+    touched.sort(key=lambda s: (s.file, s.start_line, s.end_line, s.symbol_id))
+    return touched
+
+
+def _pr_risk_level(*, touched_symbols: int, affected_symbols: int, affected_repos: int, top_score: int) -> str:
+    if affected_repos > 1 or affected_symbols >= 40 or top_score >= 40:
+        return "high"
+    if touched_symbols >= 5 or affected_symbols >= 15 or top_score >= 15:
+        return "medium"
+    return "low"
 
 
 def run_ask(args: argparse.Namespace) -> None:
