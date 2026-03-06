@@ -21,6 +21,7 @@ def main() -> None:
             "  archmind index --repo /repos/serviceA\n"
             "  archmind reset_store --store archmind.db\n"
             "  archmind explain-symbol GraphBuilder --store archmind.db\n"
+            "  archmind impact --symbol GraphBuilder --store archmind.db --depth 3\n"
             "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db\n"
             "  archmind ask --question \"Explain GraphBuilder\" --store archmind.db --source ollama"
         ),
@@ -37,6 +38,7 @@ def main() -> None:
     _add_query_parser(subparsers)
     _add_generate_context_parser(subparsers)
     _add_explain_symbol_parser(subparsers)
+    _add_impact_parser(subparsers)
     _add_ask_parser(subparsers)
 
     args = parser.parse_args()
@@ -59,6 +61,9 @@ def main() -> None:
         return
     if command == "ask":
         run_ask(args)
+        return
+    if command == "impact":
+        run_impact(args)
         return
 
     repo_paths = _resolve_repo_paths(args.repo, args.repo_list)
@@ -264,6 +269,45 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
         "--stream",
         action="store_true",
         help="Stream final Ollama answer tokens to stderr while generating.",
+    )
+
+
+def _add_impact_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "impact",
+        help="Cross-repo impact analysis for a symbol.",
+    )
+    parser.add_argument(
+        "--symbol",
+        required=True,
+        help="Symbol name or symbol_id to analyze.",
+    )
+    parser.add_argument(
+        "--store",
+        default="archmind.db",
+        help="SQLite database path (default: archmind.db).",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=int,
+        default=None,
+        help="Run ID to load (default: latest completed).",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        help="Caller traversal depth for impact propagation.",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Optional repo root for richer source snippets in context.",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional output JSON path.",
     )
 
 
@@ -534,6 +578,76 @@ def run_explain_symbol(args: argparse.Namespace) -> None:
             print(f" - {name}")
     else:
         print(" - (none)")
+
+
+def run_impact(args: argparse.Namespace) -> None:
+    from context.context_builder import ContextBuilder
+    from query import QueryEngine
+    from storage import GraphLoader
+
+    loaded = GraphLoader(args.store).load(run_id=args.run_id)
+    query = QueryEngine(loaded.graph, repo_root=args.repo_root)
+    context_builder = ContextBuilder(query)
+
+    matches = query.resolve_symbols(args.symbol)
+    if not matches:
+        raise SystemExit(f"Symbol not found: {args.symbol}")
+
+    focus = matches[0]
+    warnings: list[str] = []
+    if len(matches) > 1:
+        warnings.append(
+            f"Multiple symbols matched '{args.symbol}'. Using first match: {focus.symbol_id}"
+        )
+
+    impacted_by_level = query.impact_by_level(focus.symbol_id, depth=args.depth)
+    impacted_flat: list = []
+    seen: set[str] = set()
+    for _, symbols in sorted(impacted_by_level.items()):
+        for symbol in symbols:
+            if symbol.symbol_id in seen:
+                continue
+            seen.add(symbol.symbol_id)
+            impacted_flat.append(symbol)
+
+    direct_callees = query.callees_of(focus.symbol_id)
+
+    all_symbols = [focus] + impacted_flat
+    affected_files = sorted({symbol.file for symbol in all_symbols if symbol.file})
+    affected_repos = sorted({symbol.repo for symbol in all_symbols if symbol.repo})
+
+    result = {
+        "focus_symbol": asdict_symbol(focus),
+        "depth": args.depth,
+        "summary": {
+            "impacted_symbols": len(impacted_flat),
+            "affected_files": len(affected_files),
+            "affected_repos": len(affected_repos),
+            "cross_repo": len(affected_repos) > 1,
+            "direct_callees": len(direct_callees),
+        },
+        "impacted_by_level": {
+            str(level): [asdict_symbol(symbol) for symbol in symbols]
+            for level, symbols in sorted(impacted_by_level.items())
+        },
+        "direct_callees": [asdict_symbol(symbol) for symbol in direct_callees],
+        "affected_files": affected_files,
+        "affected_repos": affected_repos,
+        "context": context_builder.impact_context(focus.symbol_id, depth=args.depth),
+        "warnings": warnings,
+    }
+
+    envelope = {
+        "run_id": loaded.run_id,
+        "symbol_query": args.symbol,
+        "result": result,
+    }
+    content = json.dumps(_json_ready(envelope), indent=2)
+    if args.out:
+        Path(args.out).write_text(content, encoding="utf-8")
+        print(f"Wrote impact analysis to: {args.out}")
+        return
+    print(content)
 
 
 def run_ask(args: argparse.Namespace) -> None:

@@ -170,6 +170,14 @@ archmind explain-symbol GraphBuilder
 
 `explain-symbol` uses `archmind.db` by default; pass `--store <path>` to override.
 
+Run deterministic impact analysis for a symbol:
+
+```bash
+archmind impact --symbol GraphBuilder --store archmind.db --depth 3
+```
+
+This returns impacted symbols by level, affected files/repos, direct callees, and an impact context payload.
+
 Ask a natural-language architecture question:
 
 ```bash
@@ -230,4 +238,15 @@ Use a specific index run:
 
 ```bash
 archmind query --store archmind.db --run-id 42 --mode symbol_lookup --symbol GraphBuilder
+```
+
+## Example: Generating Context for LLM Assisted Impact Analysis
+
+Use these commands to build focused context payloads for a symbol/module and then feed them to an LLM.
+
+```bash
+archmind generate_context --store archmind.db --context impact_context --scope symbol --symbol "<SYMBOL>" --depth 3 --out impact_<SYMBOL>.json
+archmind generate_context --store archmind.db --context call_chain --scope symbol --symbol "<SYMBOL>" --depth 2 --direction both --out call_chain_<SYMBOL>.json
+archmind generate_context --store archmind.db --context symbol_context --scope symbol --symbol "<SYMBOL>" --out symbol_<SYMBOL>.json
+archmind generate_context --store archmind.db --context module_context --scope module --module "<MODULE>" --out module_<MODULE>.json
 ```
