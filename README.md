@@ -1,13 +1,38 @@
 # ArchMind
 
-ArchMind is a lightweight code intelligence pipeline that:
+ArchMind is a lightweight code intelligence system for repository-level architecture questions.
+
+It builds a static representation of one or more codebases, stores that representation in SQLite, and exposes deterministic and LLM-oriented workflows for:
+
+- symbol explanation
+- impact analysis
+- caller/callee tracing
+- module dependency inspection
+- PR risk analysis
+- structured context generation for downstream LLMs
+
+At a high level, ArchMind:
 
 1. Loads repository source files
 2. Parses source into Tree-sitter ASTs
-3. Extracts symbols and dependencies
-4. Resolves dependency targets to concrete symbols
+3. Extracts symbols, containment, and dependencies
+4. Resolves dependency targets to concrete symbols where possible
 5. Builds symbol and module graphs
-6. Produces LLM-ready context views
+6. Produces query results and LLM-ready context payloads
+
+## What ArchMind Is Good For
+
+Use ArchMind when you want fast, static answers to questions like:
+
+- "What breaks if I change `GraphBuilder`?"
+- "Which modules depend on `graph`?"
+- "Which symbols were touched by this PR, and what is the likely blast radius?"
+- "Give me a structured context payload for this class or module so an LLM can reason over it."
+
+## Documentation
+
+- [Approach](docs/approach.md): design goals, pipeline, tradeoffs, and current architectural direction
+- This README: installation, primary workflows, and CLI-oriented usage
 
 ## Project Structure
 
@@ -17,18 +42,28 @@ ArchMind is a lightweight code intelligence pipeline that:
   - `symbol_extractor.py`: AST -> symbols
   - `dependency_extractor.py`: AST -> dependencies (`calls`, `imports`, `inherits`)
   - `containment_extractor.py`: structural `contains` edges
+- `storage/`
+  - `index_store.py`: SQLite persistence for runs, files, ASTs, symbols, and edges
+  - `graph_loader.py`: load persisted runs back into graph structures
 - `graph/`
-  - `symbol_resolver.py`: resolve textual deps to symbol IDs
+  - `symbol_resolver.py`: resolve textual dependencies to symbol IDs
   - `graph_builder.py`: build final code graph
   - `module_graph_builder.py`: aggregate module-level dependencies
   - `code_graph.py`: graph query surface
 - `query/`
-  - `query_engine.py`: query helpers on top of graph
+  - `query_engine.py`: deterministic graph queries
+  - `query_planner.py`: heuristic or LLM-assisted natural-language planning
+- `context/`
+  - `context_builder.py`: LLM-oriented context payloads
 - `agentic/`
   - `tool_registry.py`: tool specs and registration
   - `tool_executor.py`: unified query/context tool execution with cost hints
-- `context/`
-  - `context_builder.py`: LLM-oriented context payloads
+  - `ask_agent.py`: iterative tool loop orchestration
+- `llm/`
+  - `ollama_client.py`: local-model integration
+  - `gemini_client.py`: Gemini integration
+- `archmind_cli.py`
+  - CLI entrypoint
 - `tester.py`
   - end-to-end demo pipeline
 
@@ -41,6 +76,38 @@ pip install -e .
 ```
 
 ## Quickstart
+
+Index this repository into SQLite:
+
+```bash
+archmind index --repo /home/alpha/Workspace/archmind --store archmind.db
+```
+
+Ask a deterministic question against the stored graph:
+
+```bash
+archmind ask --question "What is the impact if GraphBuilder changes?" --store archmind.db
+```
+
+Run focused impact analysis:
+
+```bash
+archmind impact --symbol GraphBuilder --store archmind.db --depth 3
+```
+
+Analyze PR risk from a local git diff:
+
+```bash
+archmind pr-risk --base main --head HEAD --store archmind.db --format summary
+```
+
+Generate structured context for LLM use:
+
+```bash
+archmind generate_context --store archmind.db --context all --scope symbol --symbol GraphBuilder
+```
+
+## Demo Path
 
 Run pipeline against this repository:
 
@@ -55,6 +122,8 @@ The output is printed by layers:
 - Layer 3: symbols + dependencies
 - Layer 4: symbol resolution
 - Layer 5: final graph (+ module edges)
+
+`tester.py` is useful for pipeline inspection and debugging. For normal usage, prefer the `archmind` CLI commands above.
 
 ## Core Data Types
 
@@ -81,12 +150,28 @@ These return structured dictionaries with:
 - `facts`
 - `warnings`
 
+## Current Capabilities
+
+- Static symbol and dependency extraction for Python, Java, and C++ through Tree-sitter-based parsing
+- SQLite-backed index runs with reloadable graph state
+- Deterministic query workflows for symbol lookup, dependencies, callers/callees, module dependencies, and impact
+- Structured context generation for symbols, classes, modules, call chains, and impact analysis
+- PR-risk analysis from local git diffs
+- Optional natural-language interfaces via heuristic planning, Ollama, or Gemini
+
+## Limitations
+
+- ArchMind is primarily a static analysis system. Dynamic dispatch, reflection, runtime imports, metaprogramming, and framework-specific wiring may be partially resolved or missed.
+- Resolution quality depends on extracted symbol quality and language-specific heuristics.
+- Cross-language architectural reasoning is still limited by per-language extractor coverage.
+- `update` currently performs a full refresh rather than a fully incremental index update.
+- LLM-backed modes improve question understanding and answer presentation, but their reasoning quality is bounded by the underlying static context.
+
 ## Notes
 
 - Tree-sitter dependencies are pinned in `setup.py` for compatibility.
 - Repository loading skips common build/tool directories and auto-detects Python virtualenv directories.
 - Needs more testing for Java and C++ support.
-
 
 ## SQLite Index Store (MVP)
 
@@ -132,6 +217,13 @@ store.close()
 ## CLI
 
 The package provides a CLI entrypoint: `archmind`.
+
+Typical workflow:
+
+1. Index one or more repositories into `archmind.db`
+2. Run deterministic queries such as `query`, `impact`, `stack-trace`, or `pr-risk`
+3. Generate `generate_context` payloads for downstream LLM use
+4. Optionally use `ask` or `ask-agent` for natural-language and tool-loop workflows
 
 Index repos and persist to SQLite:
 
@@ -245,7 +337,7 @@ archmind ask --question "Explain GraphBuilder" --store archmind.db --source gemi
 
 `--source` options:
 - `archmind` (default): heuristic planning + structured context only (no LLM answer).
-- `ollama` (or alias `ollamal`): uses Ollama for intent detection and symbol/module extraction during planning, and generates final `llm_answer`.
+- `ollama`: uses Ollama for intent detection and symbol/module extraction during planning, and generates final `llm_answer`.
 - `gemini`: uses Gemini API for intent/symbol/module extraction and final `llm_answer` (set `GEMINI_API_KEY` or pass `--api-key`).
 
 `ask` progress and latency controls:
@@ -341,3 +433,13 @@ print(executor.available_tools())  # includes schemas + cost hints
 print(executor.execute("symbol_lookup", {"symbol": "GraphBuilder"}))
 print(executor.execute("get_full_implementation", {"symbol": "GraphBuilder"}))
 ```
+
+## Choosing Between Interfaces
+
+- Use `query` when you know exactly which graph relation you want.
+- Use `impact` when you care about likely blast radius.
+- Use `stack-trace` when you need static caller/callee chains.
+- Use `pr-risk` when reviewing a diff against a known base/head.
+- Use `generate_context` when another system or LLM needs structured JSON.
+- Use `ask` when you want a single natural-language question answered.
+- Use `ask-agent` when you want an LLM to choose multiple tools iteratively.
