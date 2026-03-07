@@ -25,6 +25,7 @@ def main() -> None:
             "  archmind reset_store --store archmind.db\n"
             "  archmind explain-symbol GraphBuilder --store archmind.db\n"
             "  archmind impact --symbol GraphBuilder --store archmind.db --depth 3\n"
+            "  archmind stack-trace --symbol GraphBuilder --store archmind.db --depth 2\n"
             "  archmind pr-risk --base main --head HEAD --store archmind.db\n"
             "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db\n"
             "  archmind ask --question \"Explain GraphBuilder\" --store archmind.db --source ollama"
@@ -43,6 +44,7 @@ def main() -> None:
     _add_generate_context_parser(subparsers)
     _add_explain_symbol_parser(subparsers)
     _add_impact_parser(subparsers)
+    _add_stack_trace_parser(subparsers)
     _add_pr_risk_parser(subparsers)
     _add_ask_parser(subparsers)
 
@@ -69,6 +71,9 @@ def main() -> None:
         return
     if command == "impact":
         run_impact(args)
+        return
+    if command == "stack-trace":
+        run_stack_trace(args)
         return
     if command == "pr-risk":
         run_pr_risk(args)
@@ -358,6 +363,26 @@ def _add_pr_risk_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Output format: summary (compact) or full (verbose).",
     )
     parser.add_argument("--out", default=None, help="Optional output JSON path.")
+
+
+def _add_stack_trace_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "stack-trace",
+        help="Show static caller/callee traces for a symbol.",
+    )
+    parser.add_argument("--symbol", required=True, help="Symbol name or symbol_id.")
+    parser.add_argument("--store", default="archmind.db", help="SQLite database path (default: archmind.db).")
+    parser.add_argument("--run-id", type=int, default=None, help="Run ID to load (default: latest completed).")
+    parser.add_argument("--depth", type=int, default=2, help="Traversal depth for callers/callees.")
+    parser.add_argument("--repo-root", default=None, help="Optional repo root for source excerpts.")
+    parser.add_argument("--max-lines", type=int, default=10, help="Max source excerpt lines per symbol detail.")
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format: text (default) or json.",
+    )
+    parser.add_argument("--out", default=None, help="Optional output path.")
 
 
 def _resolve_repo_paths(repo_args: list[str], repo_list_path: str | None) -> list[Path]:
@@ -697,6 +722,175 @@ def run_impact(args: argparse.Namespace) -> None:
         print(f"Wrote impact analysis to: {args.out}")
         return
     print(content)
+
+
+def run_stack_trace(args: argparse.Namespace) -> None:
+    from query import QueryEngine
+    from storage import GraphLoader
+
+    loaded = GraphLoader(args.store).load(run_id=args.run_id)
+    query = QueryEngine(loaded.graph, repo_root=args.repo_root)
+
+    matches = query.resolve_symbols(args.symbol)
+    if not matches:
+        raise SystemExit(f"Symbol not found: {args.symbol}")
+    focus = matches[0]
+    warnings: list[str] = []
+    if len(matches) > 1:
+        warnings.append(
+            f"Multiple symbols matched '{args.symbol}'. Using first match: {focus.symbol_id}"
+        )
+
+    callers = _trace_callers(query, focus.symbol_id, depth=args.depth)
+    callees = _trace_callees(query, focus.symbol_id, depth=args.depth)
+
+    detail_ids: set[str] = {focus.symbol_id}
+    detail_ids.update(item["symbol_id"] for item in callers)
+    detail_ids.update(item["symbol_id"] for item in callees)
+    details = {}
+    for symbol_id in sorted(detail_ids):
+        symbol = query.resolve_symbol(symbol_id)
+        if symbol is None:
+            continue
+        details[symbol_id] = {
+            "symbol": asdict_symbol(symbol),
+            "signature": query.get_signature(symbol_id),
+            "docstring": query.get_docstring(symbol_id),
+            "source_excerpt": query.get_source_excerpt(symbol_id, max_lines=args.max_lines),
+        }
+
+    payload = {
+        "run_id": loaded.run_id,
+        "symbol_query": args.symbol,
+        "depth": args.depth,
+        "focus_symbol": asdict_symbol(focus),
+        "callers": callers,
+        "callees": callees,
+        "details": details,
+        "warnings": warnings,
+    }
+
+    if args.format == "json":
+        content = json.dumps(_json_ready(payload), indent=2)
+    else:
+        content = _stack_trace_text(payload)
+
+    if args.out:
+        Path(args.out).write_text(content, encoding="utf-8")
+        print(f"Wrote stack trace to: {args.out}")
+        return
+    print(content)
+
+
+def _trace_callers(query, focus_symbol_id: str, depth: int) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+    queue: list[tuple[str, int]] = [(focus_symbol_id, 0)]
+
+    while queue:
+        current_id, level = queue.pop(0)
+        if level >= depth:
+            continue
+        for edge in query.dependent_edges_of(current_id, kind="calls"):
+            caller = edge.source
+            key = (caller.symbol_id, current_id, level + 1)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "depth": level + 1,
+                    "symbol_id": caller.symbol_id,
+                    "name": caller.name,
+                    "kind": caller.kind,
+                    "file": caller.file,
+                    "line": caller.start_line,
+                    "calls": current_id,
+                }
+            )
+            queue.append((caller.symbol_id, level + 1))
+    return rows
+
+
+def _trace_callees(query, focus_symbol_id: str, depth: int) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+    queue: list[tuple[str, int]] = [(focus_symbol_id, 0)]
+
+    while queue:
+        current_id, level = queue.pop(0)
+        if level >= depth:
+            continue
+        for edge in query.dependency_edges_of(current_id, kind="calls"):
+            callee = edge.target
+            key = (current_id, callee.symbol_id, level + 1)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "depth": level + 1,
+                    "symbol_id": callee.symbol_id,
+                    "name": callee.name,
+                    "kind": callee.kind,
+                    "file": callee.file,
+                    "line": callee.start_line,
+                    "called_from": current_id,
+                }
+            )
+            queue.append((callee.symbol_id, level + 1))
+    return rows
+
+
+def _stack_trace_text(payload: dict) -> str:
+    focus = payload["focus_symbol"]
+    lines = []
+    lines.append(f"Static Stack Trace for {focus['name']}")
+    lines.append("=" * (24 + len(focus["name"])))
+    lines.append(f"Focus: {focus['name']} ({focus['kind']})")
+    lines.append(f"File: {focus['file']}:{focus['start_line']}")
+    lines.append("")
+
+    lines.append("Callers (all possible static callers):")
+    if payload["callers"]:
+        for item in payload["callers"]:
+            lines.append(
+                f"  [depth {item['depth']}] {item['name']} ({item['kind']}) at {item['file']}:{item['line']}"
+            )
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    lines.append("Callees (all possible static callees):")
+    if payload["callees"]:
+        for item in payload["callees"]:
+            lines.append(
+                f"  [depth {item['depth']}] {item['name']} ({item['kind']}) at {item['file']}:{item['line']}"
+            )
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    lines.append("Symbol Details:")
+    for symbol_id, item in payload["details"].items():
+        symbol = item["symbol"]
+        lines.append(
+            f"- {symbol['name']} [{symbol['kind']}] {symbol['file']}:{symbol['start_line']}"
+        )
+        if item["signature"]:
+            lines.append(f"  signature: {item['signature']}")
+        if item["docstring"]:
+            lines.append(f"  docstring: {item['docstring']}")
+        if item["source_excerpt"]:
+            lines.append("  source:")
+            for src_line in str(item["source_excerpt"]).splitlines():
+                lines.append(f"    {src_line}")
+    if payload["warnings"]:
+        lines.append("")
+        lines.append("Warnings:")
+        for warning in payload["warnings"]:
+            lines.append(f"- {warning}")
+    return "\n".join(lines)
 
 
 def run_pr_risk(args: argparse.Namespace) -> None:

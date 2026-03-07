@@ -178,6 +178,15 @@ archmind impact --symbol GraphBuilder --store archmind.db --depth 3
 
 This returns impacted symbols by level, affected files/repos, direct callees, and an impact context payload.
 
+Generate static caller/callee stack trace for a symbol:
+
+```bash
+archmind stack-trace --symbol GraphBuilder --store archmind.db --depth 2
+archmind stack-trace --symbol GraphBuilder --store archmind.db --depth 2 --format json --out stack_trace.json
+```
+
+This shows all possible static callers/callees (depth-bounded) and includes file/line, signature, docstring, and source excerpts.
+
 Analyze PR risk from local git diff:
 
 ```bash
