@@ -28,6 +28,7 @@ def main() -> None:
             "  archmind stack-trace --symbol GraphBuilder --store archmind.db --depth 2\n"
             "  archmind pr-risk --base main --head HEAD --store archmind.db\n"
             "  archmind ask --question \"What is the impact if GraphBuilder changes?\" --store archmind.db\n"
+            "  archmind ask-agent --question \"What breaks if I change GraphBuilder?\" --store archmind.db --source ollama\n"
             "  archmind ask --question \"Explain GraphBuilder\" --store archmind.db --source ollama"
         ),
     )
@@ -47,6 +48,7 @@ def main() -> None:
     _add_stack_trace_parser(subparsers)
     _add_pr_risk_parser(subparsers)
     _add_ask_parser(subparsers)
+    _add_ask_agent_parser(subparsers)
 
     args = parser.parse_args()
     command = args.command
@@ -77,6 +79,9 @@ def main() -> None:
         return
     if command == "pr-risk":
         run_pr_risk(args)
+        return
+    if command == "ask-agent":
+        run_ask_agent(args)
         return
 
     repo_paths = _resolve_repo_paths(args.repo, args.repo_list)
@@ -259,7 +264,7 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--source",
         default="archmind",
-        choices=["archmind", "ollama", "ollamal"],
+        choices=["archmind", "ollama", "ollamal", "gemini"],
         help="Answer source: heuristic-only archmind mode, or Ollama-backed answer generation.",
     )
     parser.add_argument(
@@ -270,7 +275,12 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--host",
         default="http://127.0.0.1:11434",
-        help="Ollama host when --source is ollama/ollamal.",
+        help="LLM host override (Ollama or Gemini API host).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Optional API key (used by Gemini source; otherwise env var can be used).",
     )
     parser.add_argument(
         "--llm-timeout",
@@ -283,6 +293,49 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Stream final Ollama answer tokens to stderr while generating.",
     )
+
+
+def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "ask-agent",
+        help="Agentic loop over tool registry (query + context tools).",
+    )
+    parser.add_argument("--question", required=True, help="Natural language question.")
+    parser.add_argument("--store", default="archmind.db", help="SQLite database path (default: archmind.db).")
+    parser.add_argument("--run-id", type=int, default=None, help="Run ID to load (default: latest completed).")
+    parser.add_argument("--repo-root", default=None, help="Optional repo root for source lookups.")
+    parser.add_argument(
+        "--source",
+        default="ollama",
+        choices=["ollama", "ollamal", "gemini"],
+        help="LLM source for agent loop.",
+    )
+    parser.add_argument("--model", default="llama3:8b", help="LLM model name.")
+    parser.add_argument(
+        "--host",
+        default="http://127.0.0.1:11434",
+        help="LLM host override (Ollama or Gemini API host).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Optional API key (used by Gemini source; otherwise env var can be used).",
+    )
+    parser.add_argument("--llm-timeout", type=int, default=600, help="LLM HTTP timeout in seconds.")
+    parser.add_argument("--max-steps", type=int, default=6, help="Maximum agent loop steps.")
+    parser.add_argument(
+        "--budget-chars",
+        type=int,
+        default=24000,
+        help="Maximum cumulative evidence summary chars in loop context.",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.75,
+        help="Minimum confidence to accept final answer in loop.",
+    )
+    parser.add_argument("--out", default=None, help="Optional output JSON path.")
 
 
 def _add_impact_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1138,6 +1191,7 @@ def run_ask(args: argparse.Namespace) -> None:
         model=args.model,
         host=args.host,
         timeout=args.llm_timeout,
+        api_key=args.api_key,
     )
     orchestrator = QueryOrchestrator(query, context_builder, llm=llm)
 
@@ -1198,7 +1252,90 @@ def run_ask(args: argparse.Namespace) -> None:
     print(content)
 
 
-def _build_llm(source: str, model: str, host: str, timeout: int):
+def run_ask_agent(args: argparse.Namespace) -> None:
+    from agentic import AgentConfig, AskAgent, ToolExecutor
+    from context.context_builder import ContextBuilder
+    from query import QueryEngine
+    from storage import GraphLoader
+
+    loaded = GraphLoader(args.store).load(run_id=args.run_id)
+    query = QueryEngine(loaded.graph, repo_root=args.repo_root)
+    context_builder = ContextBuilder(query)
+    executor = ToolExecutor(query_engine=query, context_builder=context_builder)
+    llm = _build_llm(
+        args.source,
+        model=args.model,
+        host=args.host,
+        timeout=args.llm_timeout,
+        api_key=args.api_key,
+    )
+    if llm is None:
+        raise SystemExit(f"Unsupported source for ask-agent: {args.source}")
+
+    print("[ask-agent] starting agent loop...", file=sys.stderr)
+
+    def _on_agent_event(event: str, payload: dict) -> None:
+        if event == "tool_execute_start":
+            tool = payload.get("tool")
+            tool_args = payload.get("args")
+            print(
+                f"[ask-agent] step {payload.get('step')}: calling tool `{tool}` with args={json.dumps(tool_args)}",
+                file=sys.stderr,
+            )
+            return
+        if event == "tool_execute_done":
+            print(
+                f"[ask-agent] step {payload.get('step')}: tool `{payload.get('tool')}` done (cost={payload.get('cost')})",
+                file=sys.stderr,
+            )
+            return
+        if event == "final_answer":
+            accepted = payload.get("accepted")
+            conf = payload.get("confidence")
+            status = "accepted" if accepted else "rejected_low_confidence"
+            print(
+                f"[ask-agent] step {payload.get('step')}: final_answer {status} (confidence={conf})",
+                file=sys.stderr,
+            )
+            return
+        if event == "fallback_start":
+            print("[ask-agent] max steps reached, generating fallback answer...", file=sys.stderr)
+            return
+        if event == "tool_execute_error":
+            print(
+                f"[ask-agent] step {payload.get('step')}: tool `{payload.get('tool')}` error: {payload.get('error')}",
+                file=sys.stderr,
+            )
+
+    agent = AskAgent(
+        llm=llm,
+        executor=executor,
+        config=AgentConfig(
+            max_steps=args.max_steps,
+            budget_chars=args.budget_chars,
+            confidence_threshold=args.confidence_threshold,
+            timeout=args.llm_timeout,
+            temperature=0.0,
+        ),
+        on_event=_on_agent_event,
+    )
+    result = agent.run(args.question)
+
+    envelope = {
+        "run_id": loaded.run_id,
+        "question": args.question,
+        "tools": executor.available_tools(),
+        "result": _json_ready(result),
+    }
+    content = json.dumps(envelope, indent=2)
+    if args.out:
+        Path(args.out).write_text(content, encoding="utf-8")
+        print(f"Wrote ask-agent result to: {args.out}")
+        return
+    print(content)
+
+
+def _build_llm(source: str, model: str, host: str, timeout: int, api_key: str | None = None):
     if source in {"ollama", "ollamal"}:
         try:
             from llm.ollama_client import OllamaLLM
@@ -1218,6 +1355,33 @@ def _build_llm(source: str, model: str, host: str, timeout: int):
             OllamaLLM = module.OllamaLLM
 
         return OllamaLLM(model=model, host=host, timeout=timeout)
+    if source == "gemini":
+        try:
+            from llm.gemini_client import GeminiLLM
+        except ModuleNotFoundError:
+            import importlib.util
+            import sys
+
+            module_path = Path(__file__).resolve().parent / "llm" / "gemini_client.py"
+            spec = importlib.util.spec_from_file_location("gemini_client", module_path)
+            if spec is None or spec.loader is None:
+                raise
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["gemini_client"] = module
+            spec.loader.exec_module(module)
+            GeminiLLM = module.GeminiLLM
+
+        resolved_host = host
+        if host == "http://127.0.0.1:11434":
+            # Keep CLI ergonomic: if user only switches source to gemini,
+            # default to Gemini API host automatically.
+            resolved_host = "https://generativelanguage.googleapis.com"
+        return GeminiLLM(
+            model=model,
+            api_key=api_key,
+            host=resolved_host,
+            timeout=timeout,
+        )
     return None
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 
 from graph.code_graph import CodeGraph
 from graph.module_graph_builder import module_of_file
@@ -32,6 +33,75 @@ class QueryEngine:
 
     def resolve_symbols(self, symbol_query: str) -> list[Symbol]:
         return self.graph.symbol_lookup(symbol_query)
+
+    def find_symbols_like(
+        self,
+        keyword: str,
+        kinds: set[str] | None = None,
+        limit: int = 100,
+        match_mode: str = "any",
+        return_match_info: bool = False,
+    ) -> list[Symbol]:
+        needle = keyword.strip().lower()
+        if not needle:
+            return []
+        mode = match_mode.lower().strip()
+        if mode not in {"any", "all", "phrase"}:
+            mode = "any"
+
+        tokens = _tokenize_search_query(needle)
+        if mode == "phrase":
+            tokens = [needle]
+        if not tokens:
+            tokens = [needle]
+
+        scored: list[tuple[int, int, Symbol, list[str], list[str]]] = []
+        for idx, symbol in enumerate(self.graph.nodes):
+            if kinds is not None and symbol.kind not in kinds:
+                continue
+
+            fields = {
+                "name": symbol.name.lower(),
+                "file": symbol.file.lower(),
+                "kind": symbol.kind.lower(),
+            }
+
+            matched_tokens: list[str] = []
+            matched_fields: set[str] = set()
+            for token in tokens:
+                token_hit = False
+                for field_name, field_value in fields.items():
+                    if token in field_value:
+                        token_hit = True
+                        matched_fields.add(field_name)
+                if token_hit:
+                    matched_tokens.append(token)
+
+            if mode == "all" and len(matched_tokens) != len(tokens):
+                continue
+            if mode in {"any", "phrase"} and not matched_tokens:
+                continue
+
+            # Weighted score: token coverage + field coverage.
+            score = len(matched_tokens) * 10 + len(matched_fields)
+            scored.append((score, idx, symbol, matched_tokens, sorted(matched_fields)))
+
+        # Higher score first, stable by symbol iteration order.
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        scored = scored[:limit]
+
+        if return_match_info:
+            return [
+                {
+                    "symbol": item[2],
+                    "score": item[0],
+                    "matched_tokens": item[3],
+                    "matched_fields": item[4],
+                }
+                for item in scored
+            ]
+
+        return [item[2] for item in scored]
 
     def dependency_edges_of(self, symbol_query: str, kind: str | None = None):
         edges = self.graph.dependencies_of(symbol_query)
@@ -307,3 +377,8 @@ class QueryEngine:
 
         self._python_ast_cache[relative_path] = module
         return module
+
+
+def _tokenize_search_query(value: str) -> list[str]:
+    tokens = [token for token in re.split(r"[\s,;:/\|]+", value) if token]
+    return [token.strip().lower() for token in tokens if token.strip()]

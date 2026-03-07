@@ -24,6 +24,9 @@ ArchMind is a lightweight code intelligence pipeline that:
   - `code_graph.py`: graph query surface
 - `query/`
   - `query_engine.py`: query helpers on top of graph
+- `agentic/`
+  - `tool_registry.py`: tool specs and registration
+  - `tool_executor.py`: unified query/context tool execution with cost hints
 - `context/`
   - `context_builder.py`: LLM-oriented context payloads
 - `tester.py`
@@ -203,6 +206,26 @@ This maps changed lines to touched symbols, runs per-symbol impact analysis, and
 
 `--format summary` is the default compact output for terminal use.
 
+Deterministic PR analysis (compact):
+
+```bash
+archmind pr-risk --base main --head HEAD --store archmind.db --format summary
+```
+
+Agentic PR analysis (LLM tool loop):
+
+```bash
+export GEMINI_API_KEY="your_key"
+archmind ask-agent \
+  --question "Analyze PR risk for base=main head=HEAD in repo_root=/home/alpha/Workspace/archmind. Focus on likely breakages, impacted symbols, and affected modules." \
+  --store archmind.db \
+  --source gemini \
+  --model gemini-2.5-flash \
+  --max-steps 6 \
+  --budget-chars 24000 \
+  --llm-timeout 900
+```
+
 Ask a natural-language architecture question:
 
 ```bash
@@ -217,16 +240,37 @@ Use Ollama for final answer generation:
 archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama
 archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama --llm-timeout 900
 archmind ask --question "Explain GraphBuilder" --store archmind.db --source ollama --stream
+archmind ask --question "Explain GraphBuilder" --store archmind.db --source gemini --model gemini-2.5-flash
 ```
 
 `--source` options:
 - `archmind` (default): heuristic planning + structured context only (no LLM answer).
 - `ollama` (or alias `ollamal`): uses Ollama for intent detection and symbol/module extraction during planning, and generates final `llm_answer`.
+- `gemini`: uses Gemini API for intent/symbol/module extraction and final `llm_answer` (set `GEMINI_API_KEY` or pass `--api-key`).
 
 `ask` progress and latency controls:
 - progress updates (intent/focus symbol/module) are printed to stderr while the query runs.
 - `--llm-timeout <seconds>` increases HTTP timeout for slower local models.
 - `--stream` streams final Ollama answer tokens to stderr while generation is in progress.
+
+Agentic tool loop (LLM selects tools iteratively):
+
+```bash
+archmind ask-agent --question "What breaks if I change GraphBuilder?" --store archmind.db --source ollama
+archmind ask-agent --question "What breaks if I change GraphBuilder?" --store archmind.db --source gemini --model gemini-2.5-flash
+```
+
+Useful controls:
+- `--max-steps 6`
+- `--budget-chars 24000`
+- `--confidence-threshold 0.75`
+- `--llm-timeout 900`
+
+For PR analysis with agentic loop, ask explicitly with refs so the agent can call `pr_diff_context`:
+
+```bash
+archmind ask-agent --question "Analyze PR risk for base=main head=HEAD in repo_root=/home/alpha/Workspace/archmind" --store archmind.db --source gemini --model gemini-2.5-flash
+```
 
 Generate context from SQLite:
 
@@ -274,4 +318,24 @@ archmind generate_context --store archmind.db --context impact_context --scope s
 archmind generate_context --store archmind.db --context call_chain --scope symbol --symbol "<SYMBOL>" --depth 2 --direction both --out call_chain_<SYMBOL>.json
 archmind generate_context --store archmind.db --context symbol_context --scope symbol --symbol "<SYMBOL>" --out symbol_<SYMBOL>.json
 archmind generate_context --store archmind.db --context module_context --scope module --module "<MODULE>" --out module_<MODULE>.json
+```
+
+## Agentic Tooling (MVP)
+
+You can use the unified tool executor to expose query + context tools to an LLM planning loop.
+
+```python
+from storage import GraphLoader
+from query import QueryEngine
+from context.context_builder import ContextBuilder
+from agentic import ToolExecutor
+
+loaded = GraphLoader("archmind.db").load()
+query = QueryEngine(loaded.graph, repo_root="/home/alpha/Workspace/archmind")
+context_builder = ContextBuilder(query)
+executor = ToolExecutor(query, context_builder)
+
+print(executor.available_tools())  # includes schemas + cost hints
+print(executor.execute("symbol_lookup", {"symbol": "GraphBuilder"}))
+print(executor.execute("get_full_implementation", {"symbol": "GraphBuilder"}))
 ```
