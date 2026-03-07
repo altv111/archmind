@@ -265,11 +265,13 @@ Useful controls:
 - `--budget-chars 24000`
 - `--confidence-threshold 0.75`
 - `--llm-timeout 900`
+- `--mode auto|general|pr_review`
 
 For PR analysis with agentic loop, ask explicitly with refs so the agent can call `pr_diff_context`:
 
 ```bash
 archmind ask-agent --question "Analyze PR risk for base=main head=HEAD in repo_root=/home/alpha/Workspace/archmind" --store archmind.db --source gemini --model gemini-2.5-flash
+archmind ask-agent --mode pr_review --base main --head HEAD --repo-root /home/alpha/Workspace/archmind --question "Is this PR safe to merge?" --store archmind.db --source gemini --model gemini-2.5-flash
 ```
 
 Generate context from SQLite:

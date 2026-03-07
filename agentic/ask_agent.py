@@ -14,6 +14,10 @@ class AgentConfig:
     confidence_threshold: float = 0.75
     temperature: float = 0.0
     timeout: int = 600
+    mode: str = "auto"  # auto | general | pr_review
+    pr_base: str = "main"
+    pr_head: str = "HEAD"
+    pr_repo_root: str = "."
 
 
 class AskAgent:
@@ -37,10 +41,12 @@ class AskAgent:
         messages: list[dict[str, Any]] = []
         total_cost = 0
         warnings: list[str] = []
+        mode = self._resolve_mode(question)
+        self._emit("mode_selected", {"mode": mode})
 
         for step in range(1, self.config.max_steps + 1):
             self._emit("step_start", {"step": step})
-            prompt = self._planning_prompt(question, tools, evidence, step)
+            prompt = self._planning_prompt(question, tools, evidence, step, mode)
             raw = self.llm.generate(
                 prompt=prompt,
                 temperature=self.config.temperature,
@@ -60,6 +66,7 @@ class AskAgent:
                     )
                     return {
                         "status": "completed",
+                        "mode": mode,
                         "question": question,
                         "answer": answer,
                         "confidence": confidence,
@@ -124,7 +131,7 @@ class AskAgent:
                 )
 
         # Final fallback answer synthesis if agent loop did not terminate with high confidence.
-        fallback_prompt = self._fallback_answer_prompt(question, evidence, warnings)
+        fallback_prompt = self._fallback_answer_prompt(question, evidence, warnings, mode)
         self._emit("fallback_start", {"reason": "max_steps_or_low_confidence"})
         fallback_answer = self.llm.generate(
             prompt=fallback_prompt,
@@ -134,6 +141,7 @@ class AskAgent:
         self._emit("fallback_done", {})
         return {
             "status": "max_steps_reached",
+            "mode": mode,
             "question": question,
             "answer": fallback_answer.strip(),
             "confidence": None,
@@ -150,7 +158,9 @@ class AskAgent:
         tools: list[dict[str, Any]],
         evidence: list[dict[str, Any]],
         step: int,
+        mode: str,
     ) -> str:
+        mode_directive = self._mode_directive(mode)
         return (
             "You are a code intelligence planning agent.\n"
             "Given a question, choose one next tool call or provide final answer.\n"
@@ -161,6 +171,8 @@ class AskAgent:
             "3) If enough evidence exists, return:\n"
             '{"action":"final_answer","answer":"...","confidence":0.0}\n'
             "4) Keep confidence conservative.\n\n"
+            f"Mode:\n{mode}\n"
+            f"Mode directive:\n{mode_directive}\n\n"
             f"Step: {step}\n"
             f"Question:\n{question}\n\n"
             f"Available tools:\n{json.dumps(tools, indent=2)}\n\n"
@@ -177,8 +189,36 @@ class AskAgent:
 
     @staticmethod
     def _fallback_answer_prompt(
-        question: str, evidence: list[dict[str, Any]], warnings: list[str]
+        question: str,
+        evidence: list[dict[str, Any]],
+        warnings: list[str],
+        mode: str,
     ) -> str:
+        if mode == "pr_review":
+            return (
+                "You are a senior PR risk reviewer.\n"
+                "Use only the provided evidence. Do not invent numbers.\n"
+                "Output exactly this markdown structure:\n"
+                "PR Risk Assessment\n"
+                "------------------\n\n"
+                "Risk: <LOW|MEDIUM|HIGH>\n\n"
+                "Reasoning:\n"
+                "• <bullet with evidence number>\n"
+                "• <bullet with evidence number>\n"
+                "• <bullet with evidence number>\n\n"
+                "High-risk symbols:\n"
+                "1. <symbol>\n"
+                "2. <symbol>\n"
+                "3. <symbol>\n\n"
+                "Recommendation:\n"
+                "Merge is likely safe if the following modules are tested:\n"
+                "- <module>\n"
+                "- <module>\n"
+                "- <module>\n\n"
+                f"Question:\n{question}\n\n"
+                f"Evidence:\n{json.dumps(evidence, indent=2)}\n\n"
+                f"Warnings:\n{json.dumps(warnings, indent=2)}\n"
+            )
         return (
             "You are a code intelligence assistant. Produce the best possible answer "
             "from available evidence. If uncertain, clearly state uncertainty.\n\n"
@@ -186,6 +226,31 @@ class AskAgent:
             f"Evidence:\n{json.dumps(evidence, indent=2)}\n\n"
             f"Warnings:\n{json.dumps(warnings, indent=2)}\n\n"
             "Final answer:"
+        )
+
+    def _resolve_mode(self, question: str) -> str:
+        mode = self.config.mode.lower().strip()
+        if mode in {"general", "pr_review"}:
+            return mode
+        lowered = question.lower()
+        pr_markers = ("pr", "pull request", "merge", "diff", "safe to merge", "risk")
+        if any(token in lowered for token in pr_markers):
+            return "pr_review"
+        return "general"
+
+    def _mode_directive(self, mode: str) -> str:
+        if mode != "pr_review":
+            return "General analysis mode."
+        return (
+            "You are in PR review mode.\n"
+            "Preferred first tool call: pr_diff_context.\n"
+            "Use these default args unless the user overrides them in the question:\n"
+            f'{{"base":"{self.config.pr_base}","head":"{self.config.pr_head}",'
+            f'"repo_root":"{self.config.pr_repo_root}","depth":3,"format":"summary",'
+            '"top_symbol_contexts":5,"top_module_contexts":3}\n'
+            "After pr_diff_context, optionally call symbol_context or stack_trace for top risky symbols.\n"
+            "When you have enough evidence, return final_answer in markdown PR reviewer style with:"
+            " Risk, Reasoning bullets, High-risk symbols, Recommendation test modules."
         )
 
 

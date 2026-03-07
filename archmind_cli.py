@@ -305,6 +305,14 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--run-id", type=int, default=None, help="Run ID to load (default: latest completed).")
     parser.add_argument("--repo-root", default=None, help="Optional repo root for source lookups.")
     parser.add_argument(
+        "--mode",
+        default="auto",
+        choices=["auto", "general", "pr_review"],
+        help="Agent mode. `pr_review` uses PR-focused planning/format.",
+    )
+    parser.add_argument("--base", default="main", help="Default PR base ref for pr_review mode.")
+    parser.add_argument("--head", default="HEAD", help="Default PR head ref for pr_review mode.")
+    parser.add_argument(
         "--source",
         default="ollama",
         choices=["ollama", "ollamal", "gemini"],
@@ -1275,6 +1283,9 @@ def run_ask_agent(args: argparse.Namespace) -> None:
     print("[ask-agent] starting agent loop...", file=sys.stderr)
 
     def _on_agent_event(event: str, payload: dict) -> None:
+        if event == "mode_selected":
+            print(f"[ask-agent] mode: {payload.get('mode')}", file=sys.stderr)
+            return
         if event == "tool_execute_start":
             tool = payload.get("tool")
             tool_args = payload.get("args")
@@ -1316,6 +1327,10 @@ def run_ask_agent(args: argparse.Namespace) -> None:
             confidence_threshold=args.confidence_threshold,
             timeout=args.llm_timeout,
             temperature=0.0,
+            mode=args.mode,
+            pr_base=args.base,
+            pr_head=args.head,
+            pr_repo_root=args.repo_root or ".",
         ),
         on_event=_on_agent_event,
     )
