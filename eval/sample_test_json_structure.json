@@ -1,0 +1,8 @@
+{
+  "id": 41,
+  "category": "reasoning",
+  "type": "incident_analysis",
+  "jira_context": "context/jira_001.txt",
+  "reference_rca": "context/rca_001.txt",
+  "question": "Analyze the CI/CD failure described in the Jira ticket and determine the likely root cause. Compare with the historical RCA."
+}

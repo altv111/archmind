@@ -1,0 +1,21 @@
+You are evaluating an AI model response.
+
+Question:
+What is ACID in database systems?
+
+Model Answer:
+ACID stands for Atomicity, Consistency, Isolation and Durability...
+
+Evaluation criteria:
+- Accuracy
+- Completeness
+- Hallucination
+
+Return JSON:
+
+{
+ "accuracy_score": 0-2,
+ "reasoning_score": 0-2,
+ "hallucination": "none | minor | major",
+ "comments": "short explanation"
+}

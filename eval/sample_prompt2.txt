@@ -1,0 +1,28 @@
+You are evaluating the response of an AI system.
+
+Context:
+<Jira ticket text>
+
+Historical RCA:
+<reference RCA>
+
+Question:
+<the test question>
+
+Model Answer:
+<Gemma answer>
+
+Evaluate the answer on the following criteria:
+
+1. Accuracy: Did the answer correctly identify the likely root cause?
+2. Reasoning: Is the explanation logical based on the context?
+3. Groundedness: Does the answer rely on the provided context rather than inventing details?
+
+Return JSON:
+
+{
+ "accuracy_score": 0-2,
+ "reasoning_score": 0-2,
+ "groundedness_score": 0-2,
+ "comments": "brief explanation"
+}
