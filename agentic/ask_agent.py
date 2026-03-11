@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,7 +15,7 @@ class AgentConfig:
     confidence_threshold: float = 0.75
     temperature: float = 0.0
     timeout: int = 600
-    mode: str = "auto"  # auto | general | pr_review
+    mode: str = "general"  # auto | general | pr_review
     pr_base: str = "main"
     pr_head: str = "HEAD"
     pr_repo_root: str = "."
@@ -87,7 +88,15 @@ class AskAgent:
                 continue
 
             if action.get("action") != "tool_call":
-                warnings.append(f"Step {step}: invalid action, expected tool_call/final_answer.")
+                warnings.append(_invalid_action_warning(step=step, raw=raw, parsed=action))
+                self._emit(
+                    "planner_invalid_action",
+                    {
+                        "step": step,
+                        "raw": raw,
+                        "parsed": action,
+                    },
+                )
                 continue
 
             tool_name = str(action.get("tool", "")).strip()
@@ -161,18 +170,31 @@ class AskAgent:
         mode: str,
     ) -> str:
         mode_directive = self._mode_directive(mode)
+        repo_question_guidance = (
+            "Repository-level question guidance:\n"
+            "- If the user asks to explain a repository, architecture, modules, components, or requests a diagram/mermaid graph,\n"
+            "  do not stop after only one shallow repo-level tool result unless the evidence already includes concrete module/component relationships.\n"
+            "- Prefer gathering both:\n"
+            "  1) repo-level structure via inspect_repo\n"
+            "  2) at least one deeper follow-up such as module_context, symbol_context, module_dependencies, or find_symbol_like\n"
+            "- For architecture or diagram requests, prefer another tool_call over final_answer when evidence contains only README/top-level structure.\n"
+            "- Use final_answer only when you can name the main modules/components and describe how they relate.\n"
+        )
         return (
             "You are a code intelligence planning agent.\n"
             "Given a question, choose one next tool call or provide final answer.\n"
             "Rules:\n"
-            "1) Return strict JSON only.\n"
+            "1) Return strict JSON only. Do not return prose, markdown, or explanation outside the JSON object.\n"
             "2) If more data is needed, return:\n"
             '{"action":"tool_call","tool":"<tool_name>","args":{...},"reason":"..."}\n'
             "3) If enough evidence exists, return:\n"
             '{"action":"final_answer","answer":"...","confidence":0.0}\n'
-            "4) Keep confidence conservative.\n\n"
+            "4) Keep confidence conservative.\n"
+            "5) When evidence is shallow, incomplete, or only repo-top-level, prefer tool_call over final_answer.\n"
+            "6) If you want to answer directly, you must still use action=final_answer JSON.\n\n"
             f"Mode:\n{mode}\n"
             f"Mode directive:\n{mode_directive}\n\n"
+            f"{repo_question_guidance}\n"
             f"Step: {step}\n"
             f"Question:\n{question}\n\n"
             f"Available tools:\n{json.dumps(tools, indent=2)}\n\n"
@@ -233,8 +255,15 @@ class AskAgent:
         if mode in {"general", "pr_review"}:
             return mode
         lowered = question.lower()
-        pr_markers = ("pr", "pull request", "merge", "diff", "safe to merge", "risk")
-        if any(token in lowered for token in pr_markers):
+        pr_patterns = (
+            r"\bpr\b",
+            r"\bpull request\b",
+            r"\bmerge\b",
+            r"\bdiff\b",
+            r"\bsafe to merge\b",
+            r"\brisk\b",
+        )
+        if any(re.search(pattern, lowered) for pattern in pr_patterns):
             return "pr_review"
         return "general"
 
@@ -286,3 +315,19 @@ def _summarize_result(value: Any, max_chars: int = 1800) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3] + "..."
+
+
+def _invalid_action_warning(step: int, raw: str, parsed: dict[str, Any], max_chars: int = 240) -> str:
+    raw_one_line = " ".join(raw.split())
+    if len(raw_one_line) > max_chars:
+        raw_one_line = raw_one_line[: max_chars - 3] + "..."
+    parsed_keys = sorted(parsed.keys()) if isinstance(parsed, dict) else []
+    if parsed_keys:
+        return (
+            f"Step {step}: planner returned invalid action payload "
+            f"(keys={parsed_keys}); expected action=tool_call/final_answer. raw={raw_one_line}"
+        )
+    return (
+        f"Step {step}: planner did not return valid JSON with an action field; "
+        f"expected action=tool_call/final_answer. raw={raw_one_line}"
+    )

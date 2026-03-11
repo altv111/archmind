@@ -306,7 +306,7 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--repo-root", default=None, help="Optional repo root for source lookups.")
     parser.add_argument(
         "--mode",
-        default="auto",
+        default="general",
         choices=["auto", "general", "pr_review"],
         help="Agent mode. `pr_review` uses PR-focused planning/format.",
     )
@@ -1312,6 +1312,17 @@ def run_ask_agent(args: argparse.Namespace) -> None:
         if event == "fallback_start":
             print("[ask-agent] max steps reached, generating fallback answer...", file=sys.stderr)
             return
+        if event == "planner_invalid_action":
+            parsed = payload.get("parsed") or {}
+            raw = " ".join(str(payload.get("raw") or "").split())
+            if len(raw) > 200:
+                raw = raw[:197] + "..."
+            print(
+                f"[ask-agent] step {payload.get('step')}: planner returned invalid action "
+                f"(keys={sorted(parsed.keys()) if isinstance(parsed, dict) else []}) raw={raw}",
+                file=sys.stderr,
+            )
+            return
         if event == "tool_execute_error":
             print(
                 f"[ask-agent] step {payload.get('step')}: tool `{payload.get('tool')}` error: {payload.get('error')}",
@@ -1335,6 +1346,10 @@ def run_ask_agent(args: argparse.Namespace) -> None:
         on_event=_on_agent_event,
     )
     result = agent.run(args.question)
+    answer = str(result.get("answer") or "").strip()
+    if answer:
+        print("[ask-agent] final response:", file=sys.stderr)
+        print(answer, file=sys.stderr)
 
     envelope = {
         "run_id": loaded.run_id,

@@ -430,6 +430,7 @@ context_builder = ContextBuilder(query)
 executor = ToolExecutor(query, context_builder)
 
 print(executor.available_tools())  # includes schemas + cost hints
+print(executor.execute("inspect_repo", {"max_entries": 12, "top_modules": 8}))
 print(executor.execute("symbol_lookup", {"symbol": "GraphBuilder"}))
 print(executor.execute("get_full_implementation", {"symbol": "GraphBuilder"}))
 ```
