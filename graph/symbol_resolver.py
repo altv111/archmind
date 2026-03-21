@@ -4,6 +4,7 @@ import ast
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Iterable
 
 from ingestion.dependency_extractor import Dependency
@@ -127,6 +128,28 @@ class SymbolResolver:
         if inferred is not None:
             return inferred, "var_type_inference"
 
+        # Option 3: import alias aware dotted resolution.
+        # Handles patterns like:
+        #   from airflow.utils import yaml
+        #   yaml.dump(...)
+        inferred = self._resolve_dotted_with_import_alias(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "import_alias_dotted"
+
+        # Option 4: direct import alias to symbol.
+        # Handles patterns like:
+        #   from airflow.utils.yaml import dump
+        #   dump(...)
+        inferred = self._resolve_direct_import_symbol(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "import_alias_direct"
+
         simple_name = canonical_target.split(".")[-1]
         if simple_name != canonical_target:
             dotted_candidates = self._by_name.get(simple_name, [])
@@ -214,6 +237,79 @@ class SymbolResolver:
             for method_symbol in method_candidates:
                 if method_symbol.parent == class_symbol.symbol_id:
                     return method_symbol
+        return None
+
+    def _resolve_dotted_with_import_alias(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        target = dependency.target_symbol
+        if "." not in target:
+            return None
+
+        receiver, member = target.split(".", 1)
+        if not receiver or not member:
+            return None
+
+        hints = self._python_hints_by_file.get(dependency.file)
+        if hints is None:
+            return None
+        import_target = hints.import_aliases.get(receiver)
+        if not import_target:
+            return None
+
+        # import_target examples:
+        # - airflow.utils.yaml (from airflow.utils import yaml)
+        # - airflow.utils.yaml.dump (rare, symbol-like target)
+        module_paths = [import_target]
+        if "." in import_target:
+            module_paths.append(import_target.rsplit(".", 1)[0])
+
+        candidates = self._by_name.get(member, [])
+        filtered: list[Symbol] = []
+        for symbol in candidates:
+            if any(self._symbol_module_matches(symbol, module_path) for module_path in module_paths):
+                filtered.append(symbol)
+        if filtered:
+            chosen, _ = self._pick_candidate(
+                filtered, dependency, source_symbol, "import_alias_dotted"
+            )
+            return chosen
+        return None
+
+    def _resolve_direct_import_symbol(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        target = dependency.target_symbol
+        if "." in target:
+            return None
+
+        hints = self._python_hints_by_file.get(dependency.file)
+        if hints is None:
+            return None
+        alias_target = hints.import_aliases.get(target)
+        if not alias_target:
+            return None
+        if "." not in alias_target:
+            return None
+
+        module_path, member = alias_target.rsplit(".", 1)
+        candidates = self._by_name.get(member, [])
+        filtered = [
+            symbol
+            for symbol in candidates
+            if self._symbol_module_matches(symbol, module_path)
+        ]
+        if filtered:
+            chosen, _ = self._pick_candidate(
+                filtered, dependency, source_symbol, "import_alias_direct"
+            )
+            return chosen
         return None
 
     def _canonical_target_name(
@@ -338,3 +434,37 @@ class SymbolResolver:
         if self._repo_root is not None:
             return self._repo_root / relative_path
         return Path(relative_path)
+
+    def _symbol_module_matches(self, symbol: Symbol, module_path: str) -> bool:
+        symbol_module = _python_module_from_path(symbol.file)
+        if not symbol_module:
+            return False
+        return _module_suffix_match(symbol_module, module_path)
+
+
+def _python_module_from_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+    parts = normalized.split("/")
+    # Trim common source roots while preserving package module path.
+    if parts and parts[0] in {"src", "lib", "app"}:
+        parts = parts[1:]
+    if not parts:
+        return ""
+    filename = parts[-1]
+    if filename == "__init__.py":
+        parts = parts[:-1]
+    elif filename.endswith(".py"):
+        parts[-1] = filename[:-3]
+    else:
+        # Not a python module file.
+        return ""
+    return ".".join(part for part in parts if part)
+
+
+def _module_suffix_match(symbol_module: str, import_module: str) -> bool:
+    # Exact match or dotted suffix match.
+    if symbol_module == import_module:
+        return True
+    return bool(re.search(rf"(?:^|\.){re.escape(import_module)}$", symbol_module))
