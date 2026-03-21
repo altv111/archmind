@@ -41,6 +41,8 @@ class AskAgent:
         evidence: list[dict[str, Any]] = []
         messages: list[dict[str, Any]] = []
         total_cost = 0
+        steps_used = 0
+        stop_reason = "max_steps_reached"
         llm_usage_totals: dict[str, int | None] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -48,6 +50,7 @@ class AskAgent:
             "calls": 0,
         }
         consecutive_quality_rejections = 0
+        consecutive_must_tool_violations = 0
         last_quality_rejection: dict[str, Any] | None = None
         seen_tool_calls: set[str] = set()
         warnings: list[str] = []
@@ -56,6 +59,7 @@ class AskAgent:
         self._emit("mode_selected", {"mode": mode})
 
         for step in range(1, self.config.max_steps + 1):
+            steps_used = step
             self._emit("step_start", {"step": step})
             prompt = self._planning_prompt(
                 question,
@@ -134,6 +138,7 @@ class AskAgent:
                 confidence = float(action.get("confidence", 0.0) or 0.0)
                 answer = str(action.get("answer", "")).strip()
                 if last_quality_rejection is not None:
+                    consecutive_must_tool_violations += 1
                     warnings.append(
                         f"Step {step}: final_answer rejected; must perform a tool_call after prior quality rejection."
                     )
@@ -146,7 +151,14 @@ class AskAgent:
                             "reason": "must_tool_call_after_quality_rejection",
                         },
                     )
+                    if consecutive_must_tool_violations >= 2:
+                        warnings.append(
+                            "Stopping early: planner repeatedly ignored required tool_call after quality rejection."
+                        )
+                        stop_reason = "stopped_early_quality_loop"
+                        break
                     continue
+                consecutive_must_tool_violations = 0
                 quality_ok, quality_diag = _evaluate_final_answer_quality(
                     question_class=question_class,
                     answer=answer,
@@ -191,10 +203,66 @@ class AskAgent:
                             "reason": "insufficient_specificity",
                         },
                     )
+                    recovery = _quality_recovery_tool_call(
+                        question_class=question_class,
+                        evidence=evidence,
+                    )
+                    if recovery is not None:
+                        recovery_tool, recovery_args = recovery
+                        recovery_fingerprint = _tool_call_fingerprint(recovery_tool, recovery_args)
+                        if recovery_fingerprint not in seen_tool_calls:
+                            try:
+                                self._emit(
+                                    "quality_recovery_tool",
+                                    {"step": step, "tool": recovery_tool, "args": recovery_args},
+                                )
+                                self._emit(
+                                    "tool_execute_start",
+                                    {"step": step, "tool": recovery_tool, "args": recovery_args},
+                                )
+                                recovery_execution = self.executor.execute(recovery_tool, recovery_args)
+                                self._emit(
+                                    "tool_execute_done",
+                                    {
+                                        "step": step,
+                                        "tool": recovery_tool,
+                                        "cost": recovery_execution.get("cost", 0),
+                                    },
+                                )
+                                total_cost += int(recovery_execution.get("cost", 0))
+                                recovery_summary = _summarize_result(
+                                    recovery_execution.get("result"), max_chars=1800
+                                )
+                                evidence.append(
+                                    {
+                                        "step": step,
+                                        "tool": recovery_tool,
+                                        "args": recovery_args,
+                                        "cost": recovery_execution.get("cost", 0),
+                                        "summary": recovery_summary,
+                                        "result": recovery_execution.get("result"),
+                                    }
+                                )
+                                seen_tool_calls.add(recovery_fingerprint)
+                                last_quality_rejection = None
+                                consecutive_quality_rejections = 0
+                                consecutive_must_tool_violations = 0
+                                current_size = sum(len(item.get("summary", "")) for item in evidence)
+                                while current_size > self.config.budget_chars and evidence:
+                                    dropped = evidence.pop(0)
+                                    current_size -= len(dropped.get("summary", ""))
+                                    warnings.append(
+                                        f"Dropped oldest evidence step {dropped.get('step')} to honor budget."
+                                    )
+                            except Exception as exc:  # pragma: no cover - runtime/error dependent
+                                warnings.append(
+                                    f"Step {step}: quality recovery tool execution failed for '{recovery_tool}': {exc}"
+                                )
                     if consecutive_quality_rejections >= 2:
                         warnings.append(
                             "Stopping early: repeated final_answer quality rejections without new tool evidence."
                         )
+                        stop_reason = "stopped_early_quality_loop"
                         break
                     continue
                 consecutive_quality_rejections = 0
@@ -263,6 +331,7 @@ class AskAgent:
             seen_tool_calls.add(fingerprint)
             last_quality_rejection = None
             consecutive_quality_rejections = 0
+            consecutive_must_tool_violations = 0
 
             # Hard budget guard over accumulated evidence summaries.
             current_size = sum(len(item.get("summary", "")) for item in evidence)
@@ -275,7 +344,7 @@ class AskAgent:
 
         # Final fallback answer synthesis if agent loop did not terminate with high confidence.
         fallback_prompt = self._fallback_answer_prompt(question, evidence, warnings, mode)
-        self._emit("fallback_start", {"reason": "max_steps_or_low_confidence"})
+        self._emit("fallback_start", {"reason": stop_reason})
         self._emit(
             "fallback_prompt_stats",
             {
@@ -295,12 +364,12 @@ class AskAgent:
         self._emit("llm_usage_totals", {"usage": llm_usage_totals})
         self._emit("fallback_done", {})
         return {
-            "status": "max_steps_reached",
+            "status": stop_reason,
             "mode": mode,
             "question": question,
             "answer": fallback_answer.strip(),
             "confidence": None,
-            "steps_used": self.config.max_steps,
+            "steps_used": steps_used,
             "total_cost": total_cost,
             "evidence": evidence,
             "messages": messages,
@@ -328,7 +397,7 @@ class AskAgent:
             "  do not stop after only one shallow repo-level tool result unless the evidence already includes concrete module/component relationships.\n"
             "- Prefer gathering both:\n"
             "  1) repo-level structure via inspect_repo\n"
-            "  2) at least one deeper follow-up such as module_context, symbol_context, module_dependencies, or find_symbol_like\n"
+            "  2) at least one deeper follow-up such as module_context, symbol_context, module_dependencies_ranked, module_dependencies, or find_symbol_like\n"
             "- For architecture or diagram requests, prefer another tool_call over final_answer when evidence contains only README/top-level structure.\n"
             "- Use final_answer only when you can name the main modules/components and describe how they relate.\n"
         )
@@ -492,7 +561,7 @@ class AskAgent:
             return (
                 "- Prefer inspect_repo early.\n"
                 "- Then use at least one deeper relationship tool: module_or_directory_context, directory_context(s), module_context(s), "
-                "module_dependencies, or find_symbol_like.\n"
+                "module_dependencies_ranked, module_dependencies, or find_symbol_like.\n"
                 "- Prefer fewer deeper calls over many shallow module calls.\n"
                 "- Avoid large module_contexts lists by default; start with 1-3 high-signal modules/directories.\n"
                 "- Only return final_answer when you can name concrete modules/directories and at least 1-2 explicit dependency relationships from evidence.\n"
@@ -725,7 +794,7 @@ def _architecture_terms_from_evidence(evidence: list[dict[str, Any]]) -> set[str
                     module = row.get("module") if isinstance(row, dict) else None
                     if isinstance(module, str):
                         terms.add(module)
-        elif tool in {"module_dependencies", "module_dependents"} and isinstance(result, list):
+        elif tool in {"module_dependencies", "module_dependents", "module_dependencies_ranked"} and isinstance(result, list):
             for edge in result[:200]:
                 if not isinstance(edge, dict):
                     continue
@@ -771,6 +840,45 @@ def _recent_tool_calls(evidence: list[dict[str, Any]], limit: int = 8) -> list[d
             }
         )
     return rows
+
+
+def _quality_recovery_tool_call(
+    *,
+    question_class: str,
+    evidence: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]] | None:
+    if question_class != "broad_architecture":
+        return None
+
+    candidate = _primary_architecture_target(evidence)
+    if candidate:
+        return (
+            "module_dependencies_ranked",
+            {"module": candidate, "max_edges": 10, "include_ancillary": False},
+        )
+
+    return ("inspect_repo", {"max_entries": 10, "readme_max_lines": 10, "top_modules": 5})
+
+
+def _primary_architecture_target(evidence: list[dict[str, Any]]) -> str | None:
+    for item in reversed(evidence):
+        tool = str(item.get("tool") or "")
+        args = item.get("args") or {}
+        result = item.get("result") or {}
+        if tool in {"module_dependencies_ranked", "module_dependencies", "module_context"}:
+            module = args.get("module") if isinstance(args, dict) else None
+            if isinstance(module, str) and module.strip():
+                return module
+        if tool in {"module_or_directory_context"}:
+            name = args.get("name") if isinstance(args, dict) else None
+            if isinstance(name, str) and name.strip():
+                return name
+        if tool == "inspect_repo" and isinstance(result, dict):
+            for row in result.get("top_level_modules", []) or []:
+                module = row.get("module") if isinstance(row, dict) else None
+                if isinstance(module, str) and module.strip():
+                    return module
+    return None
 
 
 def _compact_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -203,6 +203,29 @@ class ToolExecutor:
         self._register(
             registry,
             ToolSpec(
+                name="module_dependencies_ranked",
+                description=(
+                    "Get ranked module dependencies for architecture analysis "
+                    "(high-signal first; ancillary edges optionally included)."
+                ),
+                input_schema={
+                    "module": "str",
+                    "max_edges": "int",
+                    "include_ancillary": "bool",
+                },
+                output_schema={"edges": "list[dict]"},
+                cost=3,
+                tags=("query", "architecture"),
+            ),
+            lambda module, max_edges=20, include_ancillary=False: self._module_dependencies_ranked(
+                str(module),
+                max_edges=int(max_edges),
+                include_ancillary=bool(include_ancillary),
+            ),
+        )
+        self._register(
+            registry,
+            ToolSpec(
                 name="get_source_excerpt",
                 description="Get top lines from symbol implementation.",
                 input_schema={"symbol": "str", "max_lines": "int"},
@@ -646,6 +669,60 @@ class ToolExecutor:
             direction="out",
         )
 
+    def _module_dependencies_ranked(
+        self,
+        module_name: str,
+        *,
+        max_edges: int = 20,
+        include_ancillary: bool = False,
+    ) -> list[dict]:
+        edges = self._module_dependencies_with_fallback(module_name)
+        aggregated: dict[tuple[str, str], dict[str, Any]] = {}
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            source_full = str(edge.get("source_module") or "")
+            target_full = str(edge.get("target_module") or "")
+            if _is_implementation_noise(source_full) or _is_implementation_noise(target_full):
+                continue
+
+            source = _architecture_component_name(source_full)
+            target = _architecture_component_name(target_full)
+            if source == target:
+                continue
+
+            score, reasons = _architecture_edge_score(source_full, target_full)
+            ancillary = _is_ancillary_module(target) or _is_ancillary_module(source)
+            if ancillary and not include_ancillary:
+                continue
+
+            key = (source, target)
+            current = aggregated.get(key)
+            candidate = {
+                "source_module": source,
+                "target_module": target,
+                "kind": edge.get("kind", "module_depends"),
+                "score": score,
+                "ancillary": ancillary,
+                "reasons": reasons,
+                "source_example": source_full,
+                "target_example": target_full,
+            }
+            if current is None or int(candidate["score"]) > int(current["score"]):
+                aggregated[key] = candidate
+
+        ranked = list(aggregated.values())
+        ranked.sort(
+            key=lambda row: (
+                -int(row.get("score", 0)),
+                str(row.get("source_module", "")),
+                str(row.get("target_module", "")),
+            )
+        )
+        if max_edges <= 0:
+            return ranked
+        return ranked[:max_edges]
+
     def _module_dependents_with_fallback(self, module_name: str) -> list[dict]:
         direct = list(self.query.module_dependents_of(module_name))
         if direct:
@@ -782,6 +859,94 @@ def _is_empty_module_context(context: Any) -> bool:
         and len(depends) == 0
         and len(dependents) == 0
     )
+
+
+def _is_ancillary_module(name: str) -> bool:
+    lowered = name.lower()
+    patterns = (
+        ".docs",
+        ".doc",
+        ".tests",
+        ".test",
+        ".dev",
+        ".example",
+        ".examples",
+        ".benchmark",
+        ".bench",
+    )
+    if any(token in lowered for token in patterns):
+        return True
+    leaves = ("docs", "doc", "tests", "test", "dev", "examples", "benchmark", "bench")
+    return lowered.split(".")[-1] in leaves
+
+
+def _architecture_edge_score(source_module: str, target_module: str) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+
+    if source_module and target_module:
+        score += 2
+        reasons.append("base")
+
+    source_root = source_module.split(".", 1)[0] if source_module else ""
+    target_root = target_module.split(".", 1)[0] if target_module else ""
+    if source_root and target_root and source_root != target_root:
+        score += 4
+        reasons.append("cross_root")
+
+    if any(token in target_module for token in ("providers", "task-sdk", "airflow-ctl", "airflow_core", "airflow.core", "core")):
+        score += 3
+        reasons.append("domain_signal")
+
+    depth = target_module.count(".")
+    if depth <= 3:
+        score += 2
+        reasons.append("shallow_target")
+    elif depth >= 7:
+        score -= 2
+        reasons.append("deep_target")
+
+    if _is_ancillary_module(source_module) or _is_ancillary_module(target_module):
+        score -= 5
+        reasons.append("ancillary_penalty")
+
+    return score, reasons
+
+
+def _architecture_component_name(module_name: str) -> str:
+    parts = [part for part in module_name.split(".") if part]
+    if not parts:
+        return module_name
+    # Typical normalized module roots in indexed repos.
+    roots = {
+        "airflow-core",
+        "airflow-ctl",
+        "airflow-ctl-tests",
+        "airflow-e2e-tests",
+        "task-sdk",
+        "providers",
+        "dev",
+        "devel-common",
+        "clients",
+        "chart",
+    }
+    if parts[0] in roots:
+        return parts[0]
+    return parts[0]
+
+
+def _is_implementation_noise(name: str) -> bool:
+    lowered = name.lower()
+    noisy_tokens = (
+        ".hatch_build",
+        ".setup",
+        ".conftest",
+        ".docs.conf",
+        ".empty_plugin",
+        ".scripts.",
+        ".script.",
+    )
+    return any(token in lowered for token in noisy_tokens)
 
 
 def _git_changed_lines(*, repo_root: str, base: str, head: str) -> dict[str, set[int]]:

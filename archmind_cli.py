@@ -1385,8 +1385,21 @@ def run_ask_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             return
+        if event == "quality_recovery_tool":
+            print(
+                f"[ask-agent] step {payload.get('step')}: quality recovery tool `{payload.get('tool')}` with args={json.dumps(payload.get('args') or {})}",
+                file=sys.stderr,
+            )
+            return
         if event == "fallback_start":
-            print("[ask-agent] max steps reached, generating fallback answer...", file=sys.stderr)
+            reason = payload.get("reason") or "max_steps_reached"
+            if reason == "stopped_early_quality_loop":
+                print(
+                    "[ask-agent] stopping early due to quality-loop protection, generating fallback answer...",
+                    file=sys.stderr,
+                )
+            else:
+                print("[ask-agent] max steps reached, generating fallback answer...", file=sys.stderr)
             return
         if event == "fallback_prompt_stats":
             chars = payload.get("prompt_chars")
