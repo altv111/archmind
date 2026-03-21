@@ -557,9 +557,14 @@ class AskAgent:
         stage1_prompt = (
             "You are reviewing a PR for obvious defects.\n"
             "Given changed hunks and touched symbols, return strict JSON only:\n"
-            '{"local_findings":[{"severity":"low|medium|high","kind":"obvious_bug|type_mismatch|logic_risk|style","file":"...","line":0,"why":"..."}],'
+            '{"local_findings":[{"severity":"low|medium|high","kind":"obvious_bug|type_mismatch|logic_risk|style","file":"...","line":0,"why":"...",'
+            '"evidence_class":"confirmed_by_diff|inferred_from_context|generic_risk"}],'
             '"propagation_candidates":[{"symbol_id":"...","reason":"signature_or_contract_change|behavior_change|serialization_change"}],'
             '"notes":"..."}\n\n'
+            "Classification rules:\n"
+            "- confirmed_by_diff: directly visible in changed lines (signature/type/default/return mismatch).\n"
+            "- inferred_from_context: inferred from nearby code or usage context.\n"
+            "- generic_risk: general caution not tied to concrete diff evidence.\n\n"
             f"Changed hunks:\n{changed_hunks}\n\n"
             f"Touched symbols:\n{json.dumps(full_ctx.get('touched_symbols', [])[:40], indent=2)}\n"
         )
@@ -594,8 +599,13 @@ class AskAgent:
         stage2_prompt = (
             "You are reviewing changed functions for concrete defects and propagation risk.\n"
             "Return strict JSON only:\n"
-            '{"function_findings":[{"symbol_id":"...","severity":"low|medium|high","defect":"...","confidence":"low|medium|high"}],'
+            '{"function_findings":[{"symbol_id":"...","severity":"low|medium|high","defect":"...","confidence":"low|medium|high",'
+            '"evidence_class":"confirmed_by_diff|inferred_from_context|generic_risk"}],'
             '"propagation_needed":[{"symbol_id":"...","why":"..."}]}\n\n'
+            "Classification rules:\n"
+            "- confirmed_by_diff: defect is explicit in changed function excerpt.\n"
+            "- inferred_from_context: likely defect from interactions/call patterns.\n"
+            "- generic_risk: generic warning without concrete evidence.\n\n"
             f"Changed function excerpts:\n{json.dumps(changed_function_excerpts, indent=2)}\n"
         )
         stage2_raw = self.llm.generate(prompt=stage2_prompt, temperature=0.0, timeout=self.config.timeout)
@@ -660,7 +670,12 @@ class AskAgent:
             stage3_prompt = (
                 "You are doing integration breakage review.\n"
                 "Return strict JSON only:\n"
-                '{"integration_findings":[{"symbol_id":"...","severity":"low|medium|high","kind":"signature_mismatch|behavioral_break|compat_risk","evidence":"...","confidence":"low|medium|high"}]}\n\n'
+                '{"integration_findings":[{"symbol_id":"...","severity":"low|medium|high","kind":"signature_mismatch|behavioral_break|compat_risk","evidence":"...","confidence":"low|medium|high",'
+                '"evidence_class":"confirmed_by_diff|inferred_from_context|generic_risk"}]}\n\n'
+                "Classification rules:\n"
+                "- confirmed_by_diff: caller/callee snippets show direct mismatch or breakage.\n"
+                "- inferred_from_context: likely integration defect inferred from context.\n"
+                "- generic_risk: broad integration caution.\n\n"
                 f"Propagation contexts:\n{json.dumps(stage3_context, indent=2)}\n"
             )
             stage3_raw = self.llm.generate(prompt=stage3_prompt, temperature=0.0, timeout=self.config.timeout)
@@ -734,6 +749,8 @@ class AskAgent:
                 "- Use pr_llm_review evidence (if available) to identify obvious defects and integration mismatches.\n"
                 "- Then optionally use symbol_context or stack_trace for top risky symbols.\n"
                 "- In final_answer, separate: confirmed defects, likely defects, and impact-only risks.\n"
+                "- Use evidence_class tags from pr_llm_review: confirmed_by_diff, inferred_from_context, generic_risk.\n"
+                "- Prioritize confirmed_by_diff over inferred_from_context; keep generic_risk as low-priority caveats.\n"
                 "- Use final_answer after diff impact and risk evidence is present."
             )
         if question_class == "broad_architecture":
