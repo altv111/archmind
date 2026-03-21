@@ -34,6 +34,15 @@ class _PythonFileHints:
     function_hints: dict[str, _PythonFunctionHints]
 
 
+@dataclass(frozen=True)
+class _JavaFileHints:
+    package_name: str | None
+    class_imports: dict[str, str]
+    wildcard_import_packages: list[str]
+    static_member_imports: dict[str, str]
+    static_wildcard_classes: list[str]
+
+
 class SymbolResolver:
     def __init__(self, symbols: Iterable[Symbol], repo_root: str | Path | None = None) -> None:
         self._symbols: list[Symbol] = list(symbols)
@@ -42,6 +51,7 @@ class SymbolResolver:
         self._by_name: dict[str, list[Symbol]] = defaultdict(list)
         self._by_file: dict[str, list[Symbol]] = defaultdict(list)
         self._python_hints_by_file: dict[str, _PythonFileHints] = {}
+        self._java_hints_by_file: dict[str, _JavaFileHints] = {}
         for symbol in self._symbols:
             self._by_name[symbol.name].append(symbol)
             self._by_file[symbol.file].append(symbol)
@@ -50,6 +60,7 @@ class SymbolResolver:
             file_symbols.sort(key=lambda s: (s.start_line, -(s.end_line - s.start_line)))
 
         self._build_python_hints()
+        self._build_java_hints()
 
     def resolve_many(self, dependencies: Iterable[Dependency]) -> list[ResolvedDependency]:
         return [self.resolve(dependency) for dependency in dependencies]
@@ -119,6 +130,15 @@ class SymbolResolver:
             if chosen is not None:
                 return chosen, reason
 
+        if dependency.file.endswith(".java") and dependency.kind in {"imports", "inherits"}:
+            inferred = self._resolve_java_symbol_by_fqn(
+                target=canonical_target,
+                dependency=dependency,
+                source_symbol=source_symbol,
+            )
+            if inferred is not None:
+                return inferred, "java_fqn"
+
         # Option 1: local variable type inference.
         # If we see `builder.build`, use earlier assignment hints like
         # `builder = GraphBuilder()` to resolve to `GraphBuilder.build`.
@@ -149,6 +169,20 @@ class SymbolResolver:
         )
         if inferred is not None:
             return inferred, "import_alias_direct"
+
+        inferred = self._resolve_java_dotted_with_imports(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "java_import_dotted"
+
+        inferred = self._resolve_java_static_import_symbol(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "java_static_import"
 
         simple_name = canonical_target.split(".")[-1]
         if simple_name != canonical_target:
@@ -373,6 +407,68 @@ class SymbolResolver:
                 function_hints=function_hints,
             )
 
+    def _build_java_hints(self) -> None:
+        java_files = [path for path in self._by_file if path.endswith(".java")]
+        package_re = re.compile(r"^\s*package\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*;")
+        import_re = re.compile(
+            r"^\s*import\s+(static\s+)?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\.\*)*)\s*;"
+        )
+
+        for relative_path in java_files:
+            absolute_path = self._resolve_file_path(relative_path)
+            if absolute_path is None or not absolute_path.is_file():
+                continue
+            try:
+                source = absolute_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            package_name: str | None = None
+            class_imports: dict[str, str] = {}
+            wildcard_import_packages: list[str] = []
+            static_member_imports: dict[str, str] = {}
+            static_wildcard_classes: list[str] = []
+
+            for line in source.splitlines():
+                package_match = package_re.match(line)
+                if package_match:
+                    package_name = package_match.group(1)
+                    continue
+
+                import_match = import_re.match(line)
+                if not import_match:
+                    continue
+
+                is_static = bool(import_match.group(1))
+                imported = import_match.group(2).strip()
+                if not imported:
+                    continue
+
+                if is_static:
+                    if imported.endswith(".*"):
+                        static_wildcard_classes.append(imported[:-2])
+                        continue
+                    if "." not in imported:
+                        continue
+                    member_name = imported.rsplit(".", 1)[1]
+                    static_member_imports[member_name] = imported
+                    continue
+
+                if imported.endswith(".*"):
+                    wildcard_import_packages.append(imported[:-2])
+                    continue
+
+                simple_name = imported.rsplit(".", 1)[-1]
+                class_imports[simple_name] = imported
+
+            self._java_hints_by_file[relative_path] = _JavaFileHints(
+                package_name=package_name,
+                class_imports=class_imports,
+                wildcard_import_packages=wildcard_import_packages,
+                static_member_imports=static_member_imports,
+                static_wildcard_classes=static_wildcard_classes,
+            )
+
     def _infer_var_types(
         self, function_node: ast.FunctionDef | ast.AsyncFunctionDef, aliases: dict[str, str]
     ) -> dict[str, str]:
@@ -441,6 +537,205 @@ class SymbolResolver:
             return False
         return _module_suffix_match(symbol_module, module_path)
 
+    def _resolve_java_symbol_by_fqn(
+        self,
+        *,
+        target: str,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if "." not in target:
+            return None
+        class_symbol = self._resolve_java_class_symbol_by_fqn(
+            class_fqn=target,
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if class_symbol is not None:
+            return class_symbol
+        if target.count(".") < 2:
+            return None
+        class_fqn, member = target.rsplit(".", 1)
+        class_symbol = self._resolve_java_class_symbol_by_fqn(
+            class_fqn=class_fqn,
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if class_symbol is None:
+            return None
+        method_candidates = self._by_name.get(member, [])
+        methods = [m for m in method_candidates if m.parent == class_symbol.symbol_id]
+        if methods:
+            chosen, _ = self._pick_candidate(
+                methods, dependency, source_symbol, "java_fqn_member"
+            )
+            return chosen
+        return None
+
+    def _resolve_java_dotted_with_imports(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if not dependency.file.endswith(".java"):
+            return None
+        target = dependency.target_symbol
+        if "." not in target:
+            return None
+        receiver, member = target.split(".", 1)
+        if not receiver or not member:
+            return None
+
+        hints = self._java_hints_by_file.get(dependency.file)
+        class_candidates: list[Symbol] = []
+
+        if hints is not None:
+            imported_fqn = hints.class_imports.get(receiver)
+            if imported_fqn:
+                resolved = self._resolve_java_class_symbol_by_fqn(
+                    class_fqn=imported_fqn,
+                    dependency=dependency,
+                    source_symbol=source_symbol,
+                )
+                if resolved is not None:
+                    class_candidates.append(resolved)
+
+            if hints.package_name:
+                package_resolved = self._resolve_java_class_symbol_by_fqn(
+                    class_fqn=f"{hints.package_name}.{receiver}",
+                    dependency=dependency,
+                    source_symbol=source_symbol,
+                )
+                if package_resolved is not None:
+                    class_candidates.append(package_resolved)
+
+            for wildcard_package in hints.wildcard_import_packages:
+                wildcard_resolved = self._resolve_java_class_symbol_by_fqn(
+                    class_fqn=f"{wildcard_package}.{receiver}",
+                    dependency=dependency,
+                    source_symbol=source_symbol,
+                )
+                if wildcard_resolved is not None:
+                    class_candidates.append(wildcard_resolved)
+
+        same_name_classes = [
+            s
+            for s in self._by_name.get(receiver, [])
+            if s.kind in {"class", "interface", "enum"}
+        ]
+        class_candidates.extend(same_name_classes)
+
+        seen_ids: set[str] = set()
+        deduped_classes: list[Symbol] = []
+        for candidate in class_candidates:
+            if candidate.symbol_id in seen_ids:
+                continue
+            seen_ids.add(candidate.symbol_id)
+            deduped_classes.append(candidate)
+
+        method_candidates = self._by_name.get(member, [])
+        scoped_methods: list[Symbol] = []
+        class_ids = {c.symbol_id for c in deduped_classes}
+        for method_symbol in method_candidates:
+            if method_symbol.parent in class_ids:
+                scoped_methods.append(method_symbol)
+
+        if scoped_methods:
+            chosen, _ = self._pick_candidate(
+                scoped_methods, dependency, source_symbol, "java_import_dotted"
+            )
+            return chosen
+        return None
+
+    def _resolve_java_static_import_symbol(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if not dependency.file.endswith(".java"):
+            return None
+        target = dependency.target_symbol
+        if "." in target:
+            return None
+
+        hints = self._java_hints_by_file.get(dependency.file)
+        if hints is None:
+            return None
+
+        imported_member = hints.static_member_imports.get(target)
+        if imported_member:
+            class_fqn, member_name = imported_member.rsplit(".", 1)
+            class_symbol = self._resolve_java_class_symbol_by_fqn(
+                class_fqn=class_fqn,
+                dependency=dependency,
+                source_symbol=source_symbol,
+            )
+            if class_symbol is not None:
+                methods = [
+                    m
+                    for m in self._by_name.get(member_name, [])
+                    if m.parent == class_symbol.symbol_id
+                ]
+                if methods:
+                    chosen, _ = self._pick_candidate(
+                        methods, dependency, source_symbol, "java_static_import"
+                    )
+                    return chosen
+
+        wildcard_methods: list[Symbol] = []
+        for class_fqn in hints.static_wildcard_classes:
+            class_symbol = self._resolve_java_class_symbol_by_fqn(
+                class_fqn=class_fqn,
+                dependency=dependency,
+                source_symbol=source_symbol,
+            )
+            if class_symbol is None:
+                continue
+            wildcard_methods.extend(
+                [
+                    m
+                    for m in self._by_name.get(target, [])
+                    if m.parent == class_symbol.symbol_id
+                ]
+            )
+
+        if wildcard_methods:
+            chosen, _ = self._pick_candidate(
+                wildcard_methods, dependency, source_symbol, "java_static_wildcard"
+            )
+            return chosen
+        return None
+
+    def _resolve_java_class_symbol_by_fqn(
+        self,
+        *,
+        class_fqn: str,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        class_name = class_fqn.rsplit(".", 1)[-1]
+        candidates = [
+            s
+            for s in self._by_name.get(class_name, [])
+            if s.kind in {"class", "interface", "enum"}
+        ]
+        if not candidates:
+            return None
+
+        filtered = [
+            symbol
+            for symbol in candidates
+            if _java_fqn_suffix_match(_java_symbol_fqn(symbol, self._by_id), class_fqn)
+        ]
+        if not filtered:
+            return None
+        chosen, _ = self._pick_candidate(
+            filtered, dependency, source_symbol, "java_class_fqn"
+        )
+        return chosen
+
 
 def _python_module_from_path(path: str) -> str:
     normalized = path.replace("\\", "/").strip("/")
@@ -468,3 +763,60 @@ def _module_suffix_match(symbol_module: str, import_module: str) -> bool:
     if symbol_module == import_module:
         return True
     return bool(re.search(rf"(?:^|\.){re.escape(import_module)}$", symbol_module))
+
+
+def _java_fqn_suffix_match(symbol_fqn: str, import_fqn: str) -> bool:
+    if not symbol_fqn or not import_fqn:
+        return False
+    if symbol_fqn == import_fqn:
+        return True
+    return bool(re.search(rf"(?:^|\.){re.escape(import_fqn)}$", symbol_fqn))
+
+
+def _java_package_from_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+
+    parts = normalized.split("/")
+    if not parts:
+        return ""
+
+    start_index = 0
+    for marker in ("java", "kotlin", "groovy"):
+        if marker in parts:
+            start_index = parts.index(marker) + 1
+            break
+    else:
+        if parts[0] in {"src", "lib", "app"}:
+            start_index = 1
+
+    if not parts[-1].endswith(".java"):
+        return ""
+
+    package_parts = parts[start_index:-1]
+    if not package_parts:
+        return ""
+    return ".".join(package_parts)
+
+
+def _java_symbol_fqn(symbol: Symbol, by_id: dict[str, Symbol]) -> str:
+    if symbol.kind not in {"class", "interface", "enum"}:
+        return ""
+
+    package_name = _java_package_from_path(symbol.file)
+    class_parts = [symbol.name]
+    parent_id = symbol.parent
+    while parent_id:
+        parent = by_id.get(parent_id)
+        if parent is None or parent.kind not in {"class", "interface", "enum"}:
+            break
+        class_parts.insert(0, parent.name)
+        parent_id = parent.parent
+
+    class_name = ".".join(part for part in class_parts if part)
+    if not class_name:
+        return package_name
+    if not package_name:
+        return class_name
+    return f"{package_name}.{class_name}"

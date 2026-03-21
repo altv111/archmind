@@ -157,8 +157,9 @@ class PythonSymbolExtractor(BaseLanguageSymbolExtractor):
 class JavaSymbolExtractor(BaseLanguageSymbolExtractor):
     SYMBOL_NODE_KIND = {
         "class_declaration": "class",
-        "interface_declaration": "class",
+        "interface_declaration": "interface",
         "enum_declaration": "enum",
+        "record_declaration": "class",
         "method_declaration": "method",
         "constructor_declaration": "method",
     }
