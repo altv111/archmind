@@ -266,6 +266,152 @@ class QueryEngine:
             if edge.target_module == module_name
         ]
 
+    def modules(self) -> list[str]:
+        modules: set[str] = set()
+        for symbol in self.graph.nodes:
+            module = module_of_file(symbol.file)
+            if module:
+                modules.add(module)
+        return sorted(modules)
+
+    def directories(self) -> list[str]:
+        persisted = self._persisted_directory_edges()
+        if persisted:
+            dirs = {"<root>"}
+            for edge in persisted:
+                if edge.kind == "contains_dir":
+                    dirs.add(edge.target_node)
+            return sorted(dirs)
+
+        dirs: set[str] = {"<root>"}
+        for file_path in self._indexed_files():
+            parts = Path(file_path).parts[:-1]
+            if not parts:
+                continue
+            current: list[str] = []
+            for part in parts:
+                current.append(part)
+                dirs.add("/".join(current))
+        return sorted(dirs)
+
+    def directory_children(self, directory_query: str) -> dict[str, list[str]]:
+        directory = self._normalize_directory(directory_query)
+        persisted = self._persisted_directory_edges()
+        if persisted:
+            source = directory or "<root>"
+            children_dirs = sorted(
+                {
+                    edge.target_node
+                    for edge in persisted
+                    if edge.source_node == source and edge.kind == "contains_dir"
+                }
+            )
+            children_files = sorted(
+                {
+                    edge.target_node
+                    for edge in persisted
+                    if edge.source_node == source and edge.kind == "contains_file"
+                }
+            )
+            return {
+                "directory": source,
+                "directories": children_dirs,
+                "files": children_files,
+            }
+
+        children_dirs: set[str] = set()
+        children_files: set[str] = set()
+
+        for file_path in self._indexed_files():
+            path = Path(file_path)
+            parent = path.parent.as_posix()
+            parent = "" if parent == "." else parent
+
+            if directory == parent:
+                children_files.add(path.as_posix())
+                continue
+
+            if directory:
+                if not parent.startswith(f"{directory}/"):
+                    continue
+                remaining = parent[len(directory) + 1 :]
+            else:
+                remaining = parent
+
+            if not remaining:
+                continue
+            next_part = remaining.split("/", 1)[0]
+            prefix = f"{directory}/{next_part}" if directory else next_part
+            children_dirs.add(prefix)
+
+        return {
+            "directory": directory or "<root>",
+            "directories": sorted(children_dirs),
+            "files": sorted(children_files),
+        }
+
+    def files_in_directory(self, directory_query: str, recursive: bool = False) -> list[str]:
+        directory = self._normalize_directory(directory_query)
+        persisted = self._persisted_directory_edges()
+        if persisted:
+            source = directory or "<root>"
+            direct_files = {
+                edge.target_node
+                for edge in persisted
+                if edge.source_node == source and edge.kind == "contains_file"
+            }
+            if not recursive:
+                return sorted(direct_files)
+
+            files = set(direct_files)
+            frontier = [
+                edge.target_node
+                for edge in persisted
+                if edge.source_node == source and edge.kind == "contains_dir"
+            ]
+            seen_dirs = set(frontier)
+            while frontier:
+                current = frontier.pop(0)
+                for edge in persisted:
+                    if edge.source_node != current:
+                        continue
+                    if edge.kind == "contains_file":
+                        files.add(edge.target_node)
+                    elif edge.kind == "contains_dir" and edge.target_node not in seen_dirs:
+                        seen_dirs.add(edge.target_node)
+                        frontier.append(edge.target_node)
+            return sorted(files)
+
+        files: list[str] = []
+        for file_path in self._indexed_files():
+            parent = Path(file_path).parent.as_posix()
+            parent = "" if parent == "." else parent
+            if recursive:
+                if directory and not parent.startswith(f"{directory}/") and parent != directory:
+                    continue
+                files.append(file_path)
+                continue
+            if parent == directory:
+                files.append(file_path)
+        return sorted(files)
+
+    def symbols_in_directory(self, directory_query: str, recursive: bool = True) -> list[Symbol]:
+        directory = self._normalize_directory(directory_query)
+        out: list[Symbol] = []
+        for symbol in self.graph.nodes:
+            parent = Path(symbol.file).parent.as_posix()
+            parent = "" if parent == "." else parent
+            if recursive:
+                if directory:
+                    if parent == directory or parent.startswith(f"{directory}/"):
+                        out.append(symbol)
+                else:
+                    out.append(symbol)
+                continue
+            if parent == directory:
+                out.append(symbol)
+        return out
+
     def get_source_excerpt(self, symbol_query: str, max_lines: int = 10) -> str | None:
         symbol = self.resolve_symbol(symbol_query)
         if symbol is None:
@@ -377,6 +523,21 @@ class QueryEngine:
 
         self._python_ast_cache[relative_path] = module
         return module
+
+    def _indexed_files(self) -> list[str]:
+        files = {symbol.file for symbol in self.graph.nodes if symbol.file}
+        return sorted(files)
+
+    def _persisted_directory_edges(self):
+        return getattr(self.graph, "directory_edges", [])
+
+    @staticmethod
+    def _normalize_directory(directory_query: str) -> str:
+        value = (directory_query or "").strip()
+        if value in {"", ".", "<root>", "/"}:
+            return ""
+        normalized = value.strip("/")
+        return normalized
 
 
 def _tokenize_search_query(value: str) -> list[str]:

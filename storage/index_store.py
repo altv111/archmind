@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 from typing import Iterable
 
+from graph.directory_graph_builder import DirectoryEdge
 from graph.module_graph_builder import ModuleDependency
 from ingestion.dependency_extractor import Dependency
 from ingestion.symbol_extractor import Symbol
@@ -39,6 +40,7 @@ class IndexStore:
         """Delete all indexed data while keeping schema."""
         self.conn.executescript(
             """
+            DELETE FROM directory_edges;
             DELETE FROM module_edges;
             DELETE FROM dependencies;
             DELETE FROM symbols;
@@ -132,6 +134,21 @@ class IndexStore:
 
             CREATE INDEX IF NOT EXISTS idx_module_edges_src ON module_edges(source_module);
             CREATE INDEX IF NOT EXISTS idx_module_edges_tgt ON module_edges(target_module);
+
+            CREATE TABLE IF NOT EXISTS directory_edges (
+                edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                repo TEXT NOT NULL,
+                source_node TEXT NOT NULL,
+                target_node TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES index_runs(run_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_directory_edges_repo_src
+                ON directory_edges(repo, source_node);
+            CREATE INDEX IF NOT EXISTS idx_directory_edges_repo_tgt
+                ON directory_edges(repo, target_node);
             """
         )
         self._migrate_symbols_schema_if_needed()
@@ -341,6 +358,21 @@ class IndexStore:
             """
             INSERT INTO module_edges (run_id, source_module, target_module, kind)
             VALUES (?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def replace_directory_edges_for_run(self, run_id: int, directory_edges: Iterable[DirectoryEdge]) -> None:
+        self.conn.execute("DELETE FROM directory_edges WHERE run_id = ?", (run_id,))
+        rows = [
+            (run_id, edge.repo, edge.source_node, edge.target_node, edge.kind)
+            for edge in directory_edges
+        ]
+        self.conn.executemany(
+            """
+            INSERT INTO directory_edges (run_id, repo, source_node, target_node, kind)
+            VALUES (?, ?, ?, ?, ?)
             """,
             rows,
         )

@@ -100,6 +100,7 @@ def main() -> None:
             symbols=result["symbols"],
             graph_edges=result["graph_edges"],
             module_edges=result["module_edges"],
+            directory_edges=result["directory_edges"],
         )
         print(f"Stored index in SQLite: {args.store}")
     else:
@@ -264,7 +265,7 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--source",
         default="archmind",
-        choices=["archmind", "ollama", "ollamal", "gemini"],
+        choices=["archmind", "ollama", "ollamal", "gemini", "openai"],
         help="Answer source: heuristic-only archmind mode, or Ollama-backed answer generation.",
     )
     parser.add_argument(
@@ -280,7 +281,7 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="Optional API key (used by Gemini source; otherwise env var can be used).",
+        help="Optional API key (used by Gemini/OpenAI sources; otherwise env var can be used).",
     )
     parser.add_argument(
         "--llm-timeout",
@@ -315,7 +316,7 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--source",
         default="ollama",
-        choices=["ollama", "ollamal", "gemini"],
+        choices=["ollama", "ollamal", "gemini", "openai"],
         help="LLM source for agent loop.",
     )
     parser.add_argument("--model", default="llama3:8b", help="LLM model name.")
@@ -327,7 +328,7 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="Optional API key (used by Gemini source; otherwise env var can be used).",
+        help="Optional API key (used by Gemini/OpenAI sources; otherwise env var can be used).",
     )
     parser.add_argument("--llm-timeout", type=int, default=600, help="LLM HTTP timeout in seconds.")
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum agent loop steps.")
@@ -470,7 +471,7 @@ def _resolve_repo_paths(repo_args: list[str], repo_list_path: str | None) -> lis
 
 
 def run_index_pipeline(repo_paths: list[Path]) -> dict:
-    from graph import GraphBuilder
+    from graph import DirectoryGraphBuilder, GraphBuilder
     from ingestion import CodeParser, DependencyExtractor, SymbolExtractor, iter_repo
 
     source_files = []
@@ -497,6 +498,9 @@ def run_index_pipeline(repo_paths: list[Path]) -> dict:
         dependencies=dependencies,
         repo_root=_common_repo_root(repo_paths),
     )
+    directory_edges = DirectoryGraphBuilder().build(
+        (source_file.repo, source_file.path) for source_file in source_files
+    )
 
     return {
         "source_files": source_files,
@@ -506,6 +510,7 @@ def run_index_pipeline(repo_paths: list[Path]) -> dict:
         "resolved_dependencies": build_result.resolved_dependencies,
         "containment_edges": build_result.containment_edges,
         "module_edges": build_result.module_edges,
+        "directory_edges": directory_edges,
         "graph_nodes": build_result.graph.nodes,
         "graph_edges": build_result.graph.edges,
     }
@@ -521,6 +526,7 @@ def persist_to_store(
     symbols: list,
     graph_edges: list,
     module_edges: list,
+    directory_edges: list,
 ) -> None:
     from storage import IndexStore
 
@@ -555,6 +561,7 @@ def persist_to_store(
         store.replace_symbols_for_run(run.run_id, symbols)
         store.replace_dependencies_for_run(run.run_id, graph_edges)
         store.replace_module_edges_for_run(run.run_id, module_edges)
+        store.replace_directory_edges_for_run(run.run_id, directory_edges)
         store.complete_run(run.run_id, status="completed")
     except Exception:
         store.complete_run(run.run_id, status="failed")
@@ -1412,6 +1419,34 @@ def _build_llm(source: str, model: str, host: str, timeout: int, api_key: str | 
             host=resolved_host,
             timeout=timeout,
         )
+    if source == "openai":
+        try:
+            from llm.openai_client import OpenAILLM
+        except ModuleNotFoundError:
+            import importlib.util
+            import sys
+
+            module_path = Path(__file__).resolve().parent / "llm" / "openai_client.py"
+            spec = importlib.util.spec_from_file_location("openai_client", module_path)
+            if spec is None or spec.loader is None:
+                raise
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["openai_client"] = module
+            spec.loader.exec_module(module)
+            OpenAILLM = module.OpenAILLM
+
+        resolved_host = host
+        if host == "http://127.0.0.1:11434":
+            # Keep CLI ergonomic: if user only switches source to openai,
+            # default to OpenAI API host automatically.
+            resolved_host = "https://api.openai.com"
+        resolved_model = model if model != "llama3:8b" else "gpt-4o-mini"
+        return OpenAILLM(
+            model=resolved_model,
+            api_key=api_key,
+            host=resolved_host,
+            timeout=timeout,
+        )
     return None
 
 
@@ -1647,6 +1682,7 @@ def write_local_artifacts(result: dict, output_root: str) -> Path:
     _write_json(out_dir / "dependencies.json", result["dependencies"])
     _write_json(out_dir / "resolved_dependencies.json", result["resolved_dependencies"])
     _write_json(out_dir / "module_edges.json", result["module_edges"])
+    _write_json(out_dir / "directory_edges.json", result["directory_edges"])
     _write_json(out_dir / "graph_nodes.json", result["graph_nodes"])
     _write_json(out_dir / "graph_edges.json", result["graph_edges"])
 
@@ -1656,6 +1692,7 @@ def write_local_artifacts(result: dict, output_root: str) -> Path:
         "symbols": len(result["symbols"]),
         "dependencies": len(result["dependencies"]),
         "module_edges": len(result["module_edges"]),
+        "directory_edges": len(result["directory_edges"]),
         "graph_nodes": len(result["graph_nodes"]),
         "graph_edges": len(result["graph_edges"]),
     }

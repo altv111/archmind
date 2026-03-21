@@ -138,8 +138,13 @@ The output is printed by layers:
 `ContextBuilder` currently supports:
 
 - `symbol_context(symbol)`
+- `symbol_contexts([symbol1, symbol2, ...])`
 - `class_context(class_symbol)`
 - `module_context(module)`
+- `module_contexts([module1, module2, ...])`
+- `directory_context(directory, ...)`
+- `directory_contexts([dir1, dir2, ...], ...)`
+- `repo_context(...)`
 - `call_chain(symbol)`
 - `impact_context(symbol)`
 
@@ -184,6 +189,7 @@ It stores:
 - symbols (`symbols`)
 - dependencies (`dependencies`)
 - module edges (`module_edges`)
+- directory edges (`directory_edges`)
 
 Example:
 
@@ -209,6 +215,7 @@ file_id, changed = store.upsert_file(
 # store.replace_symbols_for_run(run.run_id, symbols)
 # store.replace_dependencies_for_run(run.run_id, dependencies)
 # store.replace_module_edges_for_run(run.run_id, module_edges)
+# store.replace_directory_edges_for_run(run.run_id, directory_edges)
 
 store.complete_run(run.run_id)
 store.close()
@@ -432,6 +439,10 @@ executor = ToolExecutor(query, context_builder)
 print(executor.available_tools())  # includes schemas + cost hints
 print(executor.execute("inspect_repo", {"max_entries": 12, "top_modules": 8}))
 print(executor.execute("symbol_lookup", {"symbol": "GraphBuilder"}))
+print(executor.execute("directory_context", {"directory": "query", "recursive": True}))
+print(executor.execute("symbol_contexts", {"symbols": ["GraphBuilder", "QueryEngine"]}))
+print(executor.execute("directory_contexts", {"directories": ["query", "context"], "recursive": True}))
+print(executor.execute("module_contexts", {"modules": ["graph", "query"]}))
 print(executor.execute("get_full_implementation", {"symbol": "GraphBuilder"}))
 ```
 

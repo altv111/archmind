@@ -180,6 +180,14 @@ class AskAgent:
             "- For architecture or diagram requests, prefer another tool_call over final_answer when evidence contains only README/top-level structure.\n"
             "- Use final_answer only when you can name the main modules/components and describe how they relate.\n"
         )
+        json_contract_guidance = (
+            "JSON contract reminders:\n"
+            "- The action field must be exactly one of: tool_call, final_answer\n"
+            "- Never put a tool name inside action\n"
+            '- Valid tool call example: {"action":"tool_call","tool":"impact_context","args":{"symbol":"X","depth":2},"reason":"Need impact details"}\n'
+            '- Invalid example: {"action":"impact_context","args":{"symbol":"X","depth":2},"reason":"..."}\n'
+            '- Valid final answer example: {"action":"final_answer","answer":"...","confidence":0.84}\n'
+        )
         return (
             "You are a code intelligence planning agent.\n"
             "Given a question, choose one next tool call or provide final answer.\n"
@@ -194,6 +202,7 @@ class AskAgent:
             "6) If you want to answer directly, you must still use action=final_answer JSON.\n\n"
             f"Mode:\n{mode}\n"
             f"Mode directive:\n{mode_directive}\n\n"
+            f"{json_contract_guidance}\n"
             f"{repo_question_guidance}\n"
             f"Step: {step}\n"
             f"Question:\n{question}\n\n"

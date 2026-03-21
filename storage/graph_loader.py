@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 
 from graph.code_graph import CodeGraph
+from graph.directory_graph_builder import DirectoryEdge
 from graph.module_graph_builder import ModuleDependency
 from ingestion.dependency_extractor import Dependency
 from ingestion.symbol_extractor import Symbol
@@ -33,9 +34,11 @@ class GraphLoader:
             symbols = self._load_symbols(conn, resolved_run_id)
             dependencies = self._load_dependencies(conn, resolved_run_id)
             module_edges = self._load_module_edges(conn, resolved_run_id)
+            directory_edges = self._load_directory_edges(conn, resolved_run_id)
 
             graph = CodeGraph(symbols, dependencies)
             graph.module_edges = module_edges
+            graph.directory_edges = directory_edges
             return LoadedGraph(run_id=resolved_run_id, graph=graph)
         finally:
             conn.close()
@@ -110,6 +113,29 @@ class GraphLoader:
             ModuleDependency(
                 source_module=row["source_module"],
                 target_module=row["target_module"],
+                kind=row["kind"],
+            )
+            for row in rows
+        ]
+
+    def _load_directory_edges(self, conn: sqlite3.Connection, run_id: int) -> list[DirectoryEdge]:
+        try:
+            rows = conn.execute(
+                """
+                SELECT repo, source_node, target_node, kind
+                FROM directory_edges
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Backward compatibility: older DBs may not have directory_edges yet.
+            return []
+        return [
+            DirectoryEdge(
+                repo=row["repo"],
+                source_node=row["source_node"],
+                target_node=row["target_node"],
                 kind=row["kind"],
             )
             for row in rows

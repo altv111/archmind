@@ -65,7 +65,9 @@ _EXTENSION_LANGUAGE_MAP = {
     ".yaml": "yaml",
     ".yml": "yaml",
     ".toml": "toml",
-    ".md": "markdown",
+    # Treat markdown as plain text to avoid unstable parser crashes in some
+    # third-party tree-sitter-markdown grammars on large repositories.
+    ".md": "text",
 }
 
 _SPECIAL_FILENAMES = {
