@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from agentic.tool_executor import ToolExecutor
@@ -328,6 +330,26 @@ class AskAgent:
                     "result": execution.get("result"),
                 }
             )
+            if mode == "pr_review" and tool_name == "pr_diff_context":
+                pr_llm_review = self._run_pr_llm_review(
+                    pr_args=tool_args,
+                    pr_summary=execution.get("result") or {},
+                )
+                if pr_llm_review is not None:
+                    evidence.append(
+                        {
+                            "step": step,
+                            "tool": "pr_llm_review",
+                            "args": {
+                                "base": tool_args.get("base"),
+                                "head": tool_args.get("head"),
+                                "repo_root": tool_args.get("repo_root"),
+                            },
+                            "cost": 6,
+                            "summary": _summarize_result(pr_llm_review, max_chars=1800),
+                            "result": pr_llm_review,
+                        }
+                    )
             seen_tool_calls.add(fingerprint)
             last_quality_rejection = None
             consecutive_quality_rejections = 0
@@ -500,6 +522,161 @@ class AskAgent:
             "Final answer:"
         )
 
+    def _run_pr_llm_review(
+        self,
+        *,
+        pr_args: dict[str, Any],
+        pr_summary: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        base = str(pr_args.get("base", self.config.pr_base))
+        head = str(pr_args.get("head", self.config.pr_head))
+        repo_root = str(pr_args.get("repo_root", self.config.pr_repo_root))
+        depth = int(pr_args.get("depth", 3))
+
+        try:
+            full_ctx = self.executor.execute(
+                "pr_diff_context",
+                {
+                    "base": base,
+                    "head": head,
+                    "repo_root": repo_root,
+                    "depth": depth,
+                    "format": "full",
+                    "top_symbol_contexts": 8,
+                    "top_module_contexts": 4,
+                },
+            ).get("result", {})
+        except Exception as exc:  # pragma: no cover - runtime/error dependent
+            return {
+                "status": "error",
+                "stage": "full_context",
+                "error": str(exc),
+            }
+
+        changed_hunks = _git_changed_hunks(repo_root=repo_root, base=base, head=head, max_chars=16000)
+        stage1_prompt = (
+            "You are reviewing a PR for obvious defects.\n"
+            "Given changed hunks and touched symbols, return strict JSON only:\n"
+            '{"local_findings":[{"severity":"low|medium|high","kind":"obvious_bug|type_mismatch|logic_risk|style","file":"...","line":0,"why":"..."}],'
+            '"propagation_candidates":[{"symbol_id":"...","reason":"signature_or_contract_change|behavior_change|serialization_change"}],'
+            '"notes":"..."}\n\n'
+            f"Changed hunks:\n{changed_hunks}\n\n"
+            f"Touched symbols:\n{json.dumps(full_ctx.get('touched_symbols', [])[:40], indent=2)}\n"
+        )
+        stage1_raw = self.llm.generate(prompt=stage1_prompt, temperature=0.0, timeout=self.config.timeout)
+        stage1 = _parse_json(stage1_raw)
+
+        symbol_impacts = full_ctx.get("symbol_impacts", [])
+        top_symbols = []
+        if isinstance(symbol_impacts, list):
+            top_symbols = symbol_impacts[:8]
+        changed_function_excerpts: list[dict[str, Any]] = []
+        for row in top_symbols[:6]:
+            symbol = row.get("symbol", {}) if isinstance(row, dict) else {}
+            symbol_id = symbol.get("symbol_id") if isinstance(symbol, dict) else None
+            if not isinstance(symbol_id, str):
+                continue
+            try:
+                excerpt = self.executor.execute(
+                    "get_source_excerpt", {"symbol": symbol_id, "max_lines": 60}
+                ).get("result")
+            except Exception:
+                excerpt = None
+            changed_function_excerpts.append(
+                {
+                    "symbol_id": symbol_id,
+                    "risk_score": row.get("risk_score"),
+                    "summary": row.get("summary"),
+                    "source_excerpt": excerpt,
+                }
+            )
+
+        stage2_prompt = (
+            "You are reviewing changed functions for concrete defects and propagation risk.\n"
+            "Return strict JSON only:\n"
+            '{"function_findings":[{"symbol_id":"...","severity":"low|medium|high","defect":"...","confidence":"low|medium|high"}],'
+            '"propagation_needed":[{"symbol_id":"...","why":"..."}]}\n\n'
+            f"Changed function excerpts:\n{json.dumps(changed_function_excerpts, indent=2)}\n"
+        )
+        stage2_raw = self.llm.generate(prompt=stage2_prompt, temperature=0.0, timeout=self.config.timeout)
+        stage2 = _parse_json(stage2_raw)
+
+        propagation_candidates = []
+        for source in (stage1.get("propagation_candidates"), stage2.get("propagation_needed")):
+            if isinstance(source, list):
+                for item in source:
+                    if isinstance(item, dict) and isinstance(item.get("symbol_id"), str):
+                        propagation_candidates.append(item)
+        seen_symbols: set[str] = set()
+        propagation_symbols: list[str] = []
+        for item in propagation_candidates:
+            symbol_id = str(item.get("symbol_id"))
+            if symbol_id in seen_symbols:
+                continue
+            seen_symbols.add(symbol_id)
+            propagation_symbols.append(symbol_id)
+            if len(propagation_symbols) >= 3:
+                break
+
+        stage3_context: list[dict[str, Any]] = []
+        for symbol_id in propagation_symbols:
+            callers = self.executor.execute(
+                "dependents", {"symbol": symbol_id, "kind": "calls"}
+            ).get("result", [])[:5]
+            callees = self.executor.execute(
+                "dependencies", {"symbol": symbol_id, "kind": "calls"}
+            ).get("result", [])[:5]
+
+            caller_excerpts = []
+            for caller in callers:
+                caller_id = caller.get("symbol_id") if isinstance(caller, dict) else None
+                if not isinstance(caller_id, str):
+                    continue
+                excerpt = self.executor.execute(
+                    "get_source_excerpt", {"symbol": caller_id, "max_lines": 30}
+                ).get("result")
+                caller_excerpts.append({"symbol_id": caller_id, "source_excerpt": excerpt})
+
+            callee_excerpts = []
+            for callee in callees:
+                callee_id = callee.get("symbol_id") if isinstance(callee, dict) else None
+                if not isinstance(callee_id, str):
+                    continue
+                excerpt = self.executor.execute(
+                    "get_source_excerpt", {"symbol": callee_id, "max_lines": 30}
+                ).get("result")
+                callee_excerpts.append({"symbol_id": callee_id, "source_excerpt": excerpt})
+
+            stage3_context.append(
+                {
+                    "symbol_id": symbol_id,
+                    "callers": caller_excerpts,
+                    "callees": callee_excerpts,
+                }
+            )
+
+        stage3 = {}
+        if stage3_context:
+            stage3_prompt = (
+                "You are doing integration breakage review.\n"
+                "Return strict JSON only:\n"
+                '{"integration_findings":[{"symbol_id":"...","severity":"low|medium|high","kind":"signature_mismatch|behavioral_break|compat_risk","evidence":"...","confidence":"low|medium|high"}]}\n\n'
+                f"Propagation contexts:\n{json.dumps(stage3_context, indent=2)}\n"
+            )
+            stage3_raw = self.llm.generate(prompt=stage3_prompt, temperature=0.0, timeout=self.config.timeout)
+            stage3 = _parse_json(stage3_raw)
+
+        return {
+            "status": "ok",
+            "base": base,
+            "head": head,
+            "repo_root": str(Path(repo_root).resolve()),
+            "summary": pr_summary.get("summary", {}),
+            "stage1": stage1,
+            "stage2": stage2,
+            "stage3": stage3,
+        }
+
     def _resolve_mode(self, question: str) -> str:
         mode = self.config.mode.lower().strip()
         if mode in {"general", "pr_review"}:
@@ -554,7 +731,9 @@ class AskAgent:
         if question_class == "pr_or_diff_review":
             return (
                 "- Prefer pr_diff_context first.\n"
+                "- Use pr_llm_review evidence (if available) to identify obvious defects and integration mismatches.\n"
                 "- Then optionally use symbol_context or stack_trace for top risky symbols.\n"
+                "- In final_answer, separate: confirmed defects, likely defects, and impact-only risks.\n"
                 "- Use final_answer after diff impact and risk evidence is present."
             )
         if question_class == "broad_architecture":
@@ -840,6 +1019,31 @@ def _recent_tool_calls(evidence: list[dict[str, Any]], limit: int = 8) -> list[d
             }
         )
     return rows
+
+
+def _git_changed_hunks(
+    *,
+    repo_root: str,
+    base: str,
+    head: str,
+    max_chars: int = 16000,
+) -> str:
+    cmd = [
+        "git",
+        "-C",
+        str(Path(repo_root).resolve()),
+        "diff",
+        "--unified=2",
+        "--no-color",
+        f"{base}...{head}",
+    ]
+    try:
+        text = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except Exception as exc:  # pragma: no cover - runtime/error dependent
+        return f"<diff_unavailable: {exc}>"
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
 
 
 def _quality_recovery_tool_call(
