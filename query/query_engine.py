@@ -274,6 +274,14 @@ class QueryEngine:
                 modules.add(module)
         return sorted(modules)
 
+    def modules_in_directory(self, directory_query: str, recursive: bool = True) -> list[str]:
+        modules: set[str] = set()
+        for file_path in self.files_in_directory(directory_query, recursive=recursive):
+            module = module_of_file(file_path)
+            if module:
+                modules.add(module)
+        return sorted(modules)
+
     def directories(self) -> list[str]:
         persisted = self._persisted_directory_edges()
         if persisted:

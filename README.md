@@ -142,6 +142,7 @@ The output is printed by layers:
 - `class_context(class_symbol)`
 - `module_context(module)`
 - `module_contexts([module1, module2, ...])`
+- `module_or_directory_context(name, ...)`
 - `directory_context(directory, ...)`
 - `directory_contexts([dir1, dir2, ...], ...)`
 - `repo_context(...)`
@@ -365,6 +366,14 @@ Useful controls:
 - `--confidence-threshold 0.75`
 - `--llm-timeout 900`
 - `--mode auto|general|pr_review`
+- `--debug` prints full JSON envelope to stdout (default is plain-text final answer only)
+- `--out <path>.json` writes full JSON and a sibling plain-text answer file at `<path>.json.answer.txt`
+
+`ask-agent` output behavior:
+- default: prints plain-text final answer for interactive runs.
+- `--debug`: prints JSON envelope to stdout for inspection.
+- `--out`: writes JSON envelope plus a plain-text answer sidecar file.
+- stderr includes per-step prompt/token usage and end-of-run aggregated token totals.
 
 For PR analysis with agentic loop, ask explicitly with refs so the agent can call `pr_diff_context`:
 
@@ -440,6 +449,7 @@ print(executor.available_tools())  # includes schemas + cost hints
 print(executor.execute("inspect_repo", {"max_entries": 12, "top_modules": 8}))
 print(executor.execute("symbol_lookup", {"symbol": "GraphBuilder"}))
 print(executor.execute("directory_context", {"directory": "query", "recursive": True}))
+print(executor.execute("module_or_directory_context", {"name": "airflow-core", "recursive": True}))
 print(executor.execute("symbol_contexts", {"symbols": ["GraphBuilder", "QueryEngine"]}))
 print(executor.execute("directory_contexts", {"directories": ["query", "context"], "recursive": True}))
 print(executor.execute("module_contexts", {"modules": ["graph", "query"]}))

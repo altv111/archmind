@@ -14,6 +14,7 @@ class OllamaLLM:
         self.model = model
         self.url = f"{host}/api/generate"
         self.timeout = timeout
+        self.last_usage: dict | None = None
 
     def generate(
         self,
@@ -23,6 +24,7 @@ class OllamaLLM:
         stream: bool = False,
         on_token=None,
     ) -> str:
+        self.last_usage = None
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -38,6 +40,21 @@ class OllamaLLM:
 
         if not stream:
             data = response.json()
+            self.last_usage = {
+                "provider": "ollama",
+                "prompt_tokens": data.get("prompt_eval_count"),
+                "completion_tokens": data.get("eval_count"),
+                "total_tokens": _sum_optional_ints(
+                    data.get("prompt_eval_count"),
+                    data.get("eval_count"),
+                ),
+                "raw": {
+                    "prompt_eval_count": data.get("prompt_eval_count"),
+                    "eval_count": data.get("eval_count"),
+                    "prompt_eval_duration": data.get("prompt_eval_duration"),
+                    "eval_duration": data.get("eval_duration"),
+                },
+            }
             return data["response"]
 
         chunks: list[str] = []
@@ -55,6 +72,21 @@ class OllamaLLM:
                 if on_token is not None:
                     on_token(token_text)
             if event.get("done"):
+                self.last_usage = {
+                    "provider": "ollama",
+                    "prompt_tokens": event.get("prompt_eval_count"),
+                    "completion_tokens": event.get("eval_count"),
+                    "total_tokens": _sum_optional_ints(
+                        event.get("prompt_eval_count"),
+                        event.get("eval_count"),
+                    ),
+                    "raw": {
+                        "prompt_eval_count": event.get("prompt_eval_count"),
+                        "eval_count": event.get("eval_count"),
+                        "prompt_eval_duration": event.get("prompt_eval_duration"),
+                        "eval_duration": event.get("eval_duration"),
+                    },
+                }
                 break
         return "".join(chunks)
 
@@ -149,3 +181,11 @@ class OllamaLLM:
                 return json.loads(snippet)
             except json.JSONDecodeError:
                 return {}
+
+
+def _sum_optional_ints(a, b) -> int | None:
+    if a is None and b is None:
+        return None
+    ai = int(a or 0)
+    bi = int(b or 0)
+    return ai + bi

@@ -26,6 +26,7 @@ class OpenAILLM:
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
         self.url = f"{host.rstrip('/')}/v1/chat/completions"
+        self.last_usage: dict[str, Any] | None = None
 
     def generate(
         self,
@@ -33,6 +34,7 @@ class OpenAILLM:
         temperature: float = 0.2,
         timeout: int | None = None,
     ) -> str:
+        self.last_usage = None
         payload = {
             "model": self.model,
             "messages": [
@@ -63,6 +65,7 @@ class OpenAILLM:
                         continue
                 response.raise_for_status()
                 data = response.json()
+                self.last_usage = self._extract_usage(data)
                 return self._extract_text(data)
             except requests.RequestException as exc:
                 last_error = exc
@@ -182,3 +185,17 @@ class OpenAILLM:
             except ValueError:
                 pass
         return self.backoff_seconds * (2 ** attempt)
+
+    @staticmethod
+    def _extract_usage(data: dict[str, Any]) -> dict[str, Any]:
+        usage = data.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        return {
+            "provider": "openai",
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "raw": usage,
+        }

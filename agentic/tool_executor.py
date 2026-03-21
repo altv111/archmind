@@ -198,7 +198,7 @@ class ToolExecutor:
                 cost=2,
                 tags=("query",),
             ),
-            lambda module: [asdict(edge) for edge in self.query.module_dependencies_of(module)],
+            lambda module: self._module_dependencies_with_fallback(str(module)),
         )
         self._register(
             registry,
@@ -247,7 +247,26 @@ class ToolExecutor:
                 cost=5,
                 tags=("context",),
             ),
-            lambda module: self.context.module_context(module),
+            lambda module: self._module_context_with_fallback(str(module)),
+        )
+        self._register(
+            registry,
+            ToolSpec(
+                name="module_or_directory_context",
+                description=(
+                    "Resolve input as module first, otherwise as directory; "
+                    "for directories, return contained modules and their contexts."
+                ),
+                input_schema={"name": "str", "recursive": "bool", "max_modules": "int"},
+                output_schema={"context": "dict"},
+                cost=6,
+                tags=("context", "discovery", "topdown"),
+            ),
+            lambda name, recursive=True, max_modules=20: self.context.module_or_directory_context(
+                name,
+                recursive=bool(recursive),
+                max_modules=int(max_modules),
+            ),
         )
         self._register(
             registry,
@@ -303,7 +322,19 @@ class ToolExecutor:
                 cost=7,
                 tags=("context", "batch"),
             ),
-            lambda modules: self.context.module_contexts(_to_string_list(modules)),
+            lambda modules: self._module_contexts_with_fallback(_to_string_list(modules)),
+        )
+        self._register(
+            registry,
+            ToolSpec(
+                name="module_dependents",
+                description="Get module-level dependents.",
+                input_schema={"module": "str"},
+                output_schema={"edges": "list[ModuleDependency]"},
+                cost=2,
+                tags=("query",),
+            ),
+            lambda module: self._module_dependents_with_fallback(str(module)),
         )
         self._register(
             registry,
@@ -563,6 +594,96 @@ class ToolExecutor:
             "parent": symbol.parent,
         }
 
+    def _module_context_with_fallback(self, module_name: str) -> dict:
+        primary = self.context.module_context(module_name)
+        if not _is_empty_module_context(primary):
+            return primary
+
+        fallback = self.context.module_or_directory_context(module_name)
+        return {
+            "focus": {"module": module_name, "fallback_used": True},
+            "summary": (
+                f"No direct module match for '{module_name}'. "
+                "Used module_or_directory_context fallback."
+            ),
+            "facts": {
+                "module_context": primary,
+                "fallback_context": fallback,
+            },
+            "warnings": [
+                f"module_context('{module_name}') was empty; fallback applied.",
+            ],
+        }
+
+    def _module_contexts_with_fallback(self, modules: list[str]) -> dict:
+        contexts: list[dict[str, Any]] = []
+        fallback_count = 0
+        for module_name in modules:
+            context = self._module_context_with_fallback(module_name)
+            if context.get("focus", {}).get("fallback_used"):
+                fallback_count += 1
+            contexts.append({"module": module_name, "context": context})
+
+        summary = f"Built {len(contexts)} module context payload(s)."
+        if fallback_count:
+            summary += f" Applied fallback for {fallback_count} module name(s)."
+        return {
+            "focus": {"modules": modules},
+            "summary": summary,
+            "facts": {"contexts": contexts},
+            "warnings": [],
+        }
+
+    def _module_dependencies_with_fallback(self, module_name: str) -> list[dict]:
+        direct = list(self.query.module_dependencies_of(module_name))
+        if direct:
+            return [asdict(edge) for edge in direct]
+        if module_name in set(self.query.modules()):
+            return []
+
+        return self._module_edges_via_directory_fallback(
+            module_name,
+            direction="out",
+        )
+
+    def _module_dependents_with_fallback(self, module_name: str) -> list[dict]:
+        direct = list(self.query.module_dependents_of(module_name))
+        if direct:
+            return [asdict(edge) for edge in direct]
+        if module_name in set(self.query.modules()):
+            return []
+
+        return self._module_edges_via_directory_fallback(
+            module_name,
+            direction="in",
+        )
+
+    def _module_edges_via_directory_fallback(self, name: str, direction: str) -> list[dict]:
+        resolved = self.context.module_or_directory_context(name, recursive=True, max_modules=200)
+        focus = resolved.get("focus", {})
+        if focus.get("resolved_as") != "directory":
+            return []
+
+        facts = resolved.get("facts", {})
+        modules = facts.get("modules", [])
+        if not isinstance(modules, list):
+            return []
+
+        edges: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for module_name in modules:
+            if direction == "out":
+                module_edges = self.query.module_dependencies_of(module_name)
+            else:
+                module_edges = self.query.module_dependents_of(module_name)
+            for edge in module_edges:
+                key = (edge.source_module, edge.target_module, edge.kind)
+                if key in seen:
+                    continue
+                seen.add(key)
+                edges.append(asdict(edge))
+        return edges
+
 
 def _trace_callers(query: QueryEngine, focus_symbol_id: str, depth: int) -> list[dict]:
     rows: list[dict] = []
@@ -642,6 +763,25 @@ def _to_string_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _is_empty_module_context(context: Any) -> bool:
+    if not isinstance(context, dict):
+        return True
+    facts = context.get("facts")
+    if not isinstance(facts, dict):
+        return True
+    symbols = facts.get("symbols")
+    depends = facts.get("depends_on_modules")
+    dependents = facts.get("dependent_modules")
+    return (
+        isinstance(symbols, list)
+        and isinstance(depends, list)
+        and isinstance(dependents, list)
+        and len(symbols) == 0
+        and len(depends) == 0
+        and len(dependents) == 0
+    )
 
 
 def _git_changed_lines(*, repo_root: str, base: str, head: str) -> dict[str, set[int]]:

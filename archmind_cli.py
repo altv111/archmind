@@ -344,7 +344,16 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
         default=0.75,
         help="Minimum confidence to accept final answer in loop.",
     )
-    parser.add_argument("--out", default=None, help="Optional output JSON path.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print full JSON envelope to stdout (default prints only final answer text).",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional output JSON path (also writes <out>.answer.txt with plain-text final answer).",
+    )
 
 
 def _add_impact_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1301,6 +1310,50 @@ def run_ask_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             return
+        if event == "planner_prompt_stats":
+            step = payload.get("step")
+            chars = payload.get("prompt_chars")
+            est = payload.get("prompt_tokens_est")
+            print(
+                f"[ask-agent] step {step}: planner prompt size chars={chars} est_tokens~{est}",
+                file=sys.stderr,
+            )
+            return
+        if event == "planner_llm_usage":
+            step = payload.get("step")
+            usage = payload.get("usage") or {}
+            provider = usage.get("provider", "llm")
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+            print(
+                "[ask-agent] step "
+                f"{step}: {provider} usage prompt={prompt_tokens} completion={completion_tokens} total={total_tokens}",
+                file=sys.stderr,
+            )
+            return
+        if event == "planner_repair_prompt_stats":
+            step = payload.get("step")
+            chars = payload.get("prompt_chars")
+            est = payload.get("prompt_tokens_est")
+            print(
+                f"[ask-agent] step {step}: repair prompt size chars={chars} est_tokens~{est}",
+                file=sys.stderr,
+            )
+            return
+        if event == "planner_repair_llm_usage":
+            step = payload.get("step")
+            usage = payload.get("usage") or {}
+            provider = usage.get("provider", "llm")
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+            print(
+                "[ask-agent] step "
+                f"{step}: repair {provider} usage prompt={prompt_tokens} completion={completion_tokens} total={total_tokens}",
+                file=sys.stderr,
+            )
+            return
         if event == "tool_execute_done":
             print(
                 f"[ask-agent] step {payload.get('step')}: tool `{payload.get('tool')}` done (cost={payload.get('cost')})",
@@ -1310,14 +1363,61 @@ def run_ask_agent(args: argparse.Namespace) -> None:
         if event == "final_answer":
             accepted = payload.get("accepted")
             conf = payload.get("confidence")
+            reason = payload.get("reason")
             status = "accepted" if accepted else "rejected_low_confidence"
+            if reason:
+                status = f"rejected_{reason}"
             print(
                 f"[ask-agent] step {payload.get('step')}: final_answer {status} (confidence={conf})",
                 file=sys.stderr,
             )
             return
+        if event == "final_answer_quality":
+            quality = payload.get("quality") or {}
+            print(
+                f"[ask-agent] step {payload.get('step')}: quality gate {json.dumps(quality)}",
+                file=sys.stderr,
+            )
+            return
+        if event == "planner_duplicate_tool_call":
+            print(
+                f"[ask-agent] step {payload.get('step')}: duplicate tool call skipped for `{payload.get('tool')}`",
+                file=sys.stderr,
+            )
+            return
         if event == "fallback_start":
             print("[ask-agent] max steps reached, generating fallback answer...", file=sys.stderr)
+            return
+        if event == "fallback_prompt_stats":
+            chars = payload.get("prompt_chars")
+            est = payload.get("prompt_tokens_est")
+            print(
+                f"[ask-agent] fallback prompt size chars={chars} est_tokens~{est}",
+                file=sys.stderr,
+            )
+            return
+        if event == "fallback_llm_usage":
+            usage = payload.get("usage") or {}
+            provider = usage.get("provider", "llm")
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+            print(
+                "[ask-agent] fallback "
+                f"{provider} usage prompt={prompt_tokens} completion={completion_tokens} total={total_tokens}",
+                file=sys.stderr,
+            )
+            return
+        if event == "llm_usage_totals":
+            usage = payload.get("usage") or {}
+            print(
+                "[ask-agent] llm usage totals: "
+                f"calls={usage.get('calls')} "
+                f"prompt={usage.get('prompt_tokens')} "
+                f"completion={usage.get('completion_tokens')} "
+                f"total={usage.get('total_tokens')}",
+                file=sys.stderr,
+            )
             return
         if event == "planner_invalid_action":
             parsed = payload.get("parsed") or {}
@@ -1354,9 +1454,6 @@ def run_ask_agent(args: argparse.Namespace) -> None:
     )
     result = agent.run(args.question)
     answer = str(result.get("answer") or "").strip()
-    if answer:
-        print("[ask-agent] final response:", file=sys.stderr)
-        print(answer, file=sys.stderr)
 
     envelope = {
         "run_id": loaded.run_id,
@@ -1367,9 +1464,16 @@ def run_ask_agent(args: argparse.Namespace) -> None:
     content = json.dumps(envelope, indent=2)
     if args.out:
         Path(args.out).write_text(content, encoding="utf-8")
+        answer_out = Path(f"{args.out}.answer.txt")
+        answer_out.write_text((answer + "\n") if answer else "", encoding="utf-8")
         print(f"Wrote ask-agent result to: {args.out}")
+        print(f"Wrote ask-agent plain-text answer to: {answer_out}")
         return
-    print(content)
+    if args.debug:
+        print(content)
+        return
+    if answer:
+        print(answer)
 
 
 def _build_llm(source: str, model: str, host: str, timeout: int, api_key: str | None = None):

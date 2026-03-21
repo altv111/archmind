@@ -160,6 +160,90 @@ class ContextBuilder:
             "warnings": [],
         }
 
+    def module_or_directory_context(
+        self,
+        name: str,
+        *,
+        recursive: bool = True,
+        max_modules: int = 20,
+    ) -> dict:
+        query = (name or "").strip()
+        if not query:
+            return {
+                "focus": {"name": name},
+                "summary": "Empty name.",
+                "facts": {},
+                "warnings": ["Input name is empty."],
+            }
+
+        known_modules = set(self.query.modules())
+        module_symbols = self.query.symbols_in_module(query)
+        module_deps = self.query.module_dependencies_of(query)
+        module_dependents = self.query.module_dependents_of(query)
+        is_exact_module = (
+            query in known_modules
+            or bool(module_symbols)
+            or bool(module_deps)
+            or bool(module_dependents)
+        )
+        if is_exact_module:
+            context = self.module_context(query)
+            return {
+                "focus": {"name": query, "resolved_as": "module"},
+                "summary": f"Resolved '{query}' as module.",
+                "facts": {"module_context": context},
+                "warnings": [],
+            }
+
+        directory = self._resolve_directory_name(query)
+        if directory is not None:
+            modules = self.query.modules_in_directory(directory, recursive=recursive)
+            selected_modules = modules[:max_modules]
+            module_contexts = [
+                {
+                    "module": module_name,
+                    "context": self.module_context(module_name),
+                }
+                for module_name in selected_modules
+            ]
+            warnings: list[str] = []
+            if len(modules) > max_modules:
+                warnings.append(
+                    f"Truncated module contexts to {max_modules} of {len(modules)} module(s)."
+                )
+            return {
+                "focus": {
+                    "name": query,
+                    "resolved_as": "directory",
+                    "directory": directory,
+                    "recursive": recursive,
+                },
+                "summary": (
+                    f"Resolved '{query}' as directory '{directory}' with "
+                    f"{len(modules)} module(s) in scope."
+                ),
+                "facts": {
+                    "directory_context": self.directory_context(
+                        directory, recursive=recursive
+                    ),
+                    "modules": modules,
+                    "module_contexts": module_contexts,
+                },
+                "warnings": warnings,
+            }
+
+        return {
+            "focus": {"name": query, "resolved_as": "unknown"},
+            "summary": f"Could not resolve '{query}' as module or directory.",
+            "facts": {
+                "module_candidates": [m for m in self.query.modules() if query in m][:20],
+                "directory_candidates": [d for d in self.query.directories() if query in d][:20],
+            },
+            "warnings": [
+                "No exact module or directory match found.",
+            ],
+        }
+
     def directory_context(
         self,
         directory: str,
@@ -614,6 +698,20 @@ class ContextBuilder:
             "excerpt": excerpt or None,
             "summary": first_paragraph or None,
         }
+
+    def _resolve_directory_name(self, name: str) -> str | None:
+        known = set(self.query.directories())
+        if name in known:
+            return name
+
+        normalized = name.strip().strip("/")
+        if normalized in known:
+            return normalized
+
+        if normalized in {"", ".", "<root>"} and "<root>" in known:
+            return "<root>"
+
+        return None
 
 
 def _top_level_entry_type(path: Path) -> str:

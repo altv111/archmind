@@ -28,6 +28,7 @@ class GeminiLLM:
         self.url = (
             f"{host}/v1beta/models/{model}:generateContent?key={self.api_key}"
         )
+        self.last_usage: dict[str, Any] | None = None
 
     def generate(
         self,
@@ -35,6 +36,7 @@ class GeminiLLM:
         temperature: float = 0.2,
         timeout: int | None = None,
     ) -> str:
+        self.last_usage = None
         payload = {
             "contents": [
                 {
@@ -65,6 +67,7 @@ class GeminiLLM:
                         continue
                 response.raise_for_status()
                 data = response.json()
+                self.last_usage = self._extract_usage(data)
                 return self._extract_text(data)
             except requests.RequestException as exc:
                 last_error = exc
@@ -176,3 +179,17 @@ class GeminiLLM:
             except ValueError:
                 pass
         return self.backoff_seconds * (2 ** attempt)
+
+    @staticmethod
+    def _extract_usage(data: dict[str, Any]) -> dict[str, Any]:
+        usage = data.get("usageMetadata") or {}
+        prompt_tokens = usage.get("promptTokenCount")
+        completion_tokens = usage.get("candidatesTokenCount")
+        total_tokens = usage.get("totalTokenCount")
+        return {
+            "provider": "gemini",
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "raw": usage,
+        }
