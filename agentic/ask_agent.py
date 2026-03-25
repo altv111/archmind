@@ -172,6 +172,8 @@ class AskAgent:
                         {"step": step, "question_class": question_class, "quality": quality_diag},
                     )
                 if answer and confidence >= self.config.confidence_threshold and quality_ok:
+                    if mode == "pr_review":
+                        answer = _format_pr_answer_sections(answer=answer, evidence=evidence)
                     self._emit(
                         "final_answer",
                         {"step": step, "confidence": confidence, "accepted": True},
@@ -379,6 +381,8 @@ class AskAgent:
             temperature=self.config.temperature,
             timeout=self.config.timeout,
         )
+        if mode == "pr_review":
+            fallback_answer = _format_pr_answer_sections(answer=fallback_answer, evidence=evidence)
         fallback_usage = _llm_usage_snapshot(self.llm)
         if fallback_usage is not None:
             self._emit("fallback_llm_usage", {"usage": fallback_usage})
@@ -784,6 +788,7 @@ class AskAgent:
             f'"repo_root":"{self.config.pr_repo_root}","depth":3,"format":"summary",'
             '"top_symbol_contexts":5,"top_module_contexts":3}\n'
             "After pr_diff_context, optionally call symbol_context or stack_trace for top risky symbols.\n"
+            "Do not add sections titled 'Primary changed symbols' or 'Container-only touched symbols (downweighted)'; they are appended automatically.\n"
             "When you have enough evidence, return final_answer in markdown PR reviewer style with:"
             " Risk, Reasoning bullets, High-risk symbols, Recommendation test modules."
         )
@@ -1115,3 +1120,71 @@ def _compact_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return compact
+
+
+def _format_pr_answer_sections(answer: str, evidence: list[dict[str, Any]]) -> str:
+    text = (answer or "").strip()
+    primary, container = _pr_symbol_partitions_from_evidence(evidence)
+    if not primary and not container:
+        return text
+
+    lowered = text.lower()
+    lines: list[str] = [text] if text else []
+
+    if "primary changed symbols" not in lowered:
+        lines.append("")
+        lines.append("Primary changed symbols")
+        for row in primary[:8]:
+            lines.append(f"- `{row}`")
+
+    if "container-only touched symbols" not in lowered:
+        lines.append("")
+        lines.append("Container-only touched symbols (downweighted)")
+        if container:
+            for row in container[:8]:
+                lines.append(f"- `{row}`")
+        else:
+            lines.append("- `(none)`")
+
+    return "\n".join(lines).strip()
+
+
+def _pr_symbol_partitions_from_evidence(evidence: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    for item in reversed(evidence):
+        if str(item.get("tool") or "") != "pr_diff_context":
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        primary_rows = result.get("touched_symbols")
+        container_rows = result.get("container_symbols")
+        primary = _symbol_rows_to_labels(primary_rows)
+        container = _symbol_rows_to_labels(container_rows)
+        return primary, container
+    return [], []
+
+
+def _symbol_rows_to_labels(rows: Any) -> list[str]:
+    if not isinstance(rows, list):
+        return []
+    labels: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        file_path = row.get("file")
+        line = row.get("start_line")
+        if isinstance(name, str) and isinstance(file_path, str):
+            if isinstance(line, int):
+                labels.append(f"{name} ({file_path}:{line})")
+            else:
+                labels.append(f"{name} ({file_path})")
+    # preserve order, de-dup
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        if label in seen:
+            continue
+        seen.add(label)
+        deduped.append(label)
+    return deduped

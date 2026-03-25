@@ -980,7 +980,9 @@ def run_pr_risk(args: argparse.Namespace) -> None:
     context_builder = ContextBuilder(query)
 
     changed_lines = _git_changed_lines(repo_root=args.repo_root, base=args.base, head=args.head)
-    touched_symbols = _symbols_touched_by_diff(query, changed_lines)
+    primary_touched_symbols, container_symbols, all_touched_symbols = _partition_symbols_touched_by_diff(
+        query, changed_lines
+    )
 
     per_symbol: list[dict] = []
     affected_symbol_ids: set[str] = set()
@@ -988,7 +990,7 @@ def run_pr_risk(args: argparse.Namespace) -> None:
     affected_repos: set[str] = set()
     module_hit_counts: dict[str, int] = defaultdict(int)
 
-    for symbol in touched_symbols:
+    for symbol in primary_touched_symbols:
         impacted_by_level = query.impact_by_level(symbol.symbol_id, depth=args.depth)
         call_chain = query.call_chain(symbol.symbol_id, depth=2, direction="both")
         impacted_flat = []
@@ -1003,7 +1005,9 @@ def run_pr_risk(args: argparse.Namespace) -> None:
         total_impacted = len(impacted_flat)
         direct_callers = len(query.callers_of(symbol.symbol_id))
         direct_callees = len(query.callees_of(symbol.symbol_id))
-        risk_score = total_impacted * 2 + direct_callers + direct_callees
+        base_risk_score = total_impacted * 2 + direct_callers + direct_callees
+        risk_weight = _pr_risk_weight(symbol)
+        risk_score = round(base_risk_score * risk_weight, 2)
 
         for item in [symbol] + impacted_flat:
             affected_symbol_ids.add(item.symbol_id)
@@ -1019,6 +1023,8 @@ def run_pr_risk(args: argparse.Namespace) -> None:
             {
                 "symbol": asdict_symbol(symbol),
                 "risk_score": risk_score,
+                "base_risk_score": base_risk_score,
+                "risk_weight": risk_weight,
                 "summary": {
                     "impacted_symbols": total_impacted,
                     "direct_callers": direct_callers,
@@ -1060,13 +1066,14 @@ def run_pr_risk(args: argparse.Namespace) -> None:
 
     summary = {
         "changed_files": len(changed_lines),
-        "touched_symbols": len(touched_symbols),
+        "touched_symbols": len(primary_touched_symbols),
+        "container_symbols": len(container_symbols),
         "affected_symbols": len(affected_symbol_ids),
         "affected_files": len(affected_files),
         "affected_repos": len(affected_repos),
         "cross_repo": len(affected_repos) > 1,
         "risk_level": _pr_risk_level(
-            touched_symbols=len(touched_symbols),
+            touched_symbols=len(primary_touched_symbols),
             affected_symbols=len(affected_symbol_ids),
             affected_repos=len(affected_repos),
             top_score=per_symbol[0]["risk_score"] if per_symbol else 0,
@@ -1081,7 +1088,9 @@ def run_pr_risk(args: argparse.Namespace) -> None:
         "changed_files": {
             file: sorted(lines) for file, lines in sorted(changed_lines.items())
         },
-        "touched_symbols": [asdict_symbol(s) for s in touched_symbols],
+        "touched_symbols": [asdict_symbol(s) for s in primary_touched_symbols],
+        "container_symbols": [asdict_symbol(s) for s in container_symbols],
+        "all_touched_symbols": [asdict_symbol(s) for s in all_touched_symbols],
         "symbol_impacts": per_symbol,
         "contexts": {
             "top_symbol_contexts": symbol_contexts,
@@ -1096,6 +1105,8 @@ def run_pr_risk(args: argparse.Namespace) -> None:
                 "name": item["symbol"]["name"],
                 "file": item["symbol"]["file"],
                 "risk_score": item["risk_score"],
+                "base_risk_score": item["base_risk_score"],
+                "risk_weight": item["risk_weight"],
                 "impacted_symbols": item["summary"]["impacted_symbols"],
                 "direct_callers": item["summary"]["direct_callers"],
                 "direct_callees": item["summary"]["direct_callees"],
@@ -1181,17 +1192,75 @@ def _git_changed_lines(*, repo_root: str, base: str, head: str) -> dict[str, set
     return changed
 
 
-def _symbols_touched_by_diff(query, changed_lines: dict[str, set[int]]) -> list:
-    touched = []
+def _partition_symbols_touched_by_diff(query, changed_lines: dict[str, set[int]]) -> tuple[list, list, list]:
+    all_touched = []
     for symbol in query.all_symbols():
         lines = changed_lines.get(symbol.file)
         if not lines:
             continue
         if any(symbol.start_line <= line <= symbol.end_line for line in lines):
-            touched.append(symbol)
-    # stable order for deterministic output
-    touched.sort(key=lambda s: (s.file, s.start_line, s.end_line, s.symbol_id))
-    return touched
+            all_touched.append(symbol)
+
+    all_touched.sort(key=lambda s: (s.file, s.start_line, s.end_line, s.symbol_id))
+    touched_by_file: dict[str, list] = defaultdict(list)
+    by_id: dict[str, object] = {}
+    for symbol in all_touched:
+        touched_by_file[symbol.file].append(symbol)
+        by_id[symbol.symbol_id] = symbol
+
+    primary_ids: set[str] = set()
+    for file_path, lines in changed_lines.items():
+        candidates = touched_by_file.get(file_path, [])
+        if not candidates:
+            continue
+        for line in lines:
+            overlaps = [s for s in candidates if s.start_line <= line <= s.end_line]
+            if not overlaps:
+                continue
+            overlaps.sort(
+                key=lambda s: (
+                    (s.end_line - s.start_line),
+                    -s.start_line,
+                    s.symbol_id,
+                )
+            )
+            primary_ids.add(overlaps[0].symbol_id)
+
+    primary = [by_id[sid] for sid in sorted(primary_ids) if sid in by_id]
+    primary.sort(key=lambda s: (s.file, s.start_line, s.end_line, s.symbol_id))
+    containers = [s for s in all_touched if s.symbol_id not in primary_ids]
+    return primary, containers, all_touched
+
+
+def _pr_risk_weight(symbol: object) -> float:
+    path = str(getattr(symbol, "file", "") or "").replace("\\", "/").lower()
+    kind = str(getattr(symbol, "kind", "") or "").lower()
+
+    weight = 1.0
+    if _is_test_path(path):
+        weight *= 0.25
+    elif _is_ancillary_path(path):
+        weight *= 0.5
+
+    if kind in {"class", "module", "namespace", "interface", "enum"}:
+        weight *= 0.55
+    return max(weight, 0.1)
+
+
+def _is_test_path(path: str) -> bool:
+    filename = path.split("/")[-1] if path else ""
+    if "/tests/" in path or "/test/" in path:
+        return True
+    if ".spec." in filename or ".test." in filename:
+        return True
+    if filename.startswith("test_") or filename.endswith("_test.py"):
+        return True
+    return False
+
+
+def _is_ancillary_path(path: str) -> bool:
+    tokens = ("/docs/", "/doc/", "/examples/", "/example/", "/dev/", "/scripts/", "/bench/", "/benchmark/")
+    return any(token in path for token in tokens)
 
 
 def _pr_risk_level(*, touched_symbols: int, affected_symbols: int, affected_repos: int, top_score: int) -> str:
