@@ -404,6 +404,168 @@ class JavaDependencyExtractor(BaseLanguageDependencyExtractor):
         return (source, targets) if targets else None
 
 
+class JavaScriptDependencyExtractor(BaseLanguageDependencyExtractor):
+    SCOPE_NODE_TYPES = {
+        "function_declaration",
+        "generator_function_declaration",
+        "method_definition",
+        "class_declaration",
+        "variable_declarator",
+    }
+    IMPORT_NODE_TYPES = {
+        "import_statement",
+        "export_statement",
+        "lexical_declaration",
+        "variable_declaration",
+    }
+    CALL_NODE_TYPES = {"call_expression", "new_expression"}
+    INHERIT_NODE_TYPES = {"class_declaration"}
+    BUILTIN_CALL_TARGETS = {
+        "console",
+        "console.log",
+        "console.error",
+        "console.warn",
+        "Math",
+        "JSON",
+        "Object",
+        "Array",
+        "String",
+        "Number",
+        "Boolean",
+        "Promise",
+        "setTimeout",
+        "setInterval",
+        "require",
+    }
+
+    def _scope_name(self, node: Node, source_bytes: bytes) -> str | None:
+        if node.type == "variable_declarator":
+            name_node = node.child_by_field_name("name")
+            if name_node is None:
+                return None
+            return self._clean_symbol(self._node_text(name_node, source_bytes))
+
+        if node.type == "method_definition":
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                return self._clean_symbol(self._node_text(name_node, source_bytes))
+
+        return super()._scope_name(node, source_bytes)
+
+    def _import_targets(self, node: Node, source_bytes: bytes) -> list[str]:
+        text = self._node_text(node, source_bytes)
+        out: list[str] = []
+        seen: set[str] = set()
+
+        for pattern in (
+            r"\bfrom\s+[\"']([^\"']+)[\"']",
+            r"^\s*import\s+[\"']([^\"']+)[\"']",
+            r"\brequire\s*\(\s*[\"']([^\"']+)[\"']\s*\)",
+        ):
+            for match in re.finditer(pattern, text):
+                target = self._clean_symbol(match.group(1))
+                if target and target not in seen:
+                    seen.add(target)
+                    out.append(target)
+        return out
+
+    def _call_target(self, node: Node, source_bytes: bytes) -> str | None:
+        if node.type == "new_expression":
+            ctor_node = (
+                node.child_by_field_name("constructor")
+                or node.child_by_field_name("callee")
+                or node.child_by_field_name("function")
+            )
+            if ctor_node is not None:
+                return self._normalize_call_target(self._node_text(ctor_node, source_bytes))
+
+            text = self._node_text(node, source_bytes)
+            match = re.match(r"new\s+([A-Za-z_$][\w\.$]*)\s*\(", text)
+            return self._normalize_call_target(match.group(1)) if match else None
+
+        function_node = node.child_by_field_name("function")
+        if function_node is not None:
+            return self._normalize_call_target(self._node_text(function_node, source_bytes))
+
+        text = self._node_text(node, source_bytes)
+        match = re.match(r"([A-Za-z_$][\w\.$]*)\s*\(", text)
+        return self._normalize_call_target(match.group(1)) if match else None
+
+    def _should_emit_call_target(self, target_symbol: str) -> bool:
+        if target_symbol in self.BUILTIN_CALL_TARGETS:
+            return False
+        if target_symbol.startswith("console."):
+            return False
+        return True
+
+    def _inheritance(
+        self, node: Node, source_bytes: bytes
+    ) -> tuple[str, list[str]] | None:
+        source = self._scope_name(node, source_bytes)
+        if not source:
+            return None
+
+        targets: list[str] = []
+        superclass = node.child_by_field_name("superclass")
+        if superclass is not None:
+            target = self._normalize_call_target(self._node_text(superclass, source_bytes))
+            if target:
+                targets.append(target)
+
+        if not targets:
+            text = self._node_text(node, source_bytes)
+            match = re.search(r"\bextends\s+([A-Za-z_$][\w\.$]*)", text)
+            if match:
+                targets.append(self._clean_symbol(match.group(1)))
+
+        return (source, targets) if targets else None
+
+
+class TypeScriptDependencyExtractor(JavaScriptDependencyExtractor):
+    SCOPE_NODE_TYPES = JavaScriptDependencyExtractor.SCOPE_NODE_TYPES | {
+        "interface_declaration",
+        "abstract_class_declaration",
+    }
+    INHERIT_NODE_TYPES = {
+        "class_declaration",
+        "abstract_class_declaration",
+        "interface_declaration",
+    }
+
+    def _inheritance(
+        self, node: Node, source_bytes: bytes
+    ) -> tuple[str, list[str]] | None:
+        source = self._scope_name(node, source_bytes)
+        if not source:
+            return None
+
+        targets: list[str] = []
+        text = self._node_text(node, source_bytes)
+
+        for match in re.finditer(r"\bextends\s+([A-Za-z_$][\w\.$]*(?:\s*,\s*[A-Za-z_$][\w\.$]*)*)", text):
+            for candidate in match.group(1).split(","):
+                cleaned = self._clean_symbol(candidate)
+                if cleaned:
+                    targets.append(cleaned)
+
+        implements_match = re.search(r"\bimplements\s+([A-Za-z0-9_$\.,\s]+)\{?", text)
+        if implements_match:
+            for candidate in implements_match.group(1).split(","):
+                cleaned = self._clean_symbol(candidate)
+                if cleaned:
+                    targets.append(cleaned)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for target in targets:
+            if target in seen:
+                continue
+            seen.add(target)
+            deduped.append(target)
+
+        return (source, deduped) if deduped else None
+
+
 class CppDependencyExtractor(BaseLanguageDependencyExtractor):
     SCOPE_NODE_TYPES = {"function_definition", "class_specifier", "struct_specifier"}
     IMPORT_NODE_TYPES = {"preproc_include"}
@@ -496,6 +658,8 @@ class DependencyExtractor:
         self._extractors: dict[str, BaseLanguageDependencyExtractor] = {
             "python": PythonDependencyExtractor(),
             "java": JavaDependencyExtractor(),
+            "javascript": JavaScriptDependencyExtractor(),
+            "typescript": TypeScriptDependencyExtractor(),
             "cpp": CppDependencyExtractor(),
             "c": CppDependencyExtractor(),
         }

@@ -11,17 +11,21 @@ from .dependency_extractor import (
     CppDependencyExtractor,
     Dependency,
     DependencyExtractor,
+    JavaScriptDependencyExtractor,
     JavaDependencyExtractor,
     PythonDependencyExtractor,
+    TypeScriptDependencyExtractor,
 )
 from .repo_loader import SourceFile, iter_repo, iter_repos, load_repos
 from .symbol_extractor import (
     BaseLanguageSymbolExtractor,
     CppSymbolExtractor,
+    JavaScriptSymbolExtractor,
     JavaSymbolExtractor,
     PythonSymbolExtractor,
     Symbol,
     SymbolExtractor,
+    TypeScriptSymbolExtractor,
 )
 
 __all__ = [
@@ -36,10 +40,14 @@ __all__ = [
     "CppDependencyExtractor",
     "PythonDependencyExtractor",
     "JavaDependencyExtractor",
+    "JavaScriptDependencyExtractor",
+    "TypeScriptDependencyExtractor",
     "BaseLanguageSymbolExtractor",
     "CppSymbolExtractor",
     "PythonSymbolExtractor",
     "JavaSymbolExtractor",
+    "JavaScriptSymbolExtractor",
+    "TypeScriptSymbolExtractor",
     "Symbol",
     "SymbolExtractor",
     "iter_repo",

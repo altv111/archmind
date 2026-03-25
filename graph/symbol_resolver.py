@@ -43,6 +43,16 @@ class _JavaFileHints:
     static_wildcard_classes: list[str]
 
 
+@dataclass(frozen=True)
+class _JsTsFileHints:
+    import_default: dict[str, str]
+    import_namespace: dict[str, str]
+    import_named: dict[str, str]
+    require_default: dict[str, str]
+    require_named: dict[str, str]
+    var_types: dict[str, str]
+
+
 class SymbolResolver:
     def __init__(self, symbols: Iterable[Symbol], repo_root: str | Path | None = None) -> None:
         self._symbols: list[Symbol] = list(symbols)
@@ -52,6 +62,7 @@ class SymbolResolver:
         self._by_file: dict[str, list[Symbol]] = defaultdict(list)
         self._python_hints_by_file: dict[str, _PythonFileHints] = {}
         self._java_hints_by_file: dict[str, _JavaFileHints] = {}
+        self._js_ts_hints_by_file: dict[str, _JsTsFileHints] = {}
         for symbol in self._symbols:
             self._by_name[symbol.name].append(symbol)
             self._by_file[symbol.file].append(symbol)
@@ -61,6 +72,7 @@ class SymbolResolver:
 
         self._build_python_hints()
         self._build_java_hints()
+        self._build_js_ts_hints()
 
     def resolve_many(self, dependencies: Iterable[Dependency]) -> list[ResolvedDependency]:
         return [self.resolve(dependency) for dependency in dependencies]
@@ -183,6 +195,34 @@ class SymbolResolver:
         )
         if inferred is not None:
             return inferred, "java_static_import"
+
+        inferred = self._resolve_js_ts_dotted_with_var_type(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "js_ts_var_type"
+
+        inferred = self._resolve_js_ts_dotted_with_import_alias(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "js_ts_import_dotted"
+
+        inferred = self._resolve_js_ts_direct_import_symbol(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "js_ts_import_direct"
+
+        inferred = self._resolve_js_ts_import_target(
+            dependency=dependency,
+            source_symbol=source_symbol,
+        )
+        if inferred is not None:
+            return inferred, "js_ts_import_target"
 
         simple_name = canonical_target.split(".")[-1]
         if simple_name != canonical_target:
@@ -469,6 +509,163 @@ class SymbolResolver:
                 static_wildcard_classes=static_wildcard_classes,
             )
 
+    def _build_js_ts_hints(self) -> None:
+        js_ts_files = [
+            path
+            for path in self._by_file
+            if path.endswith((".js", ".jsx", ".ts", ".tsx"))
+        ]
+        import_from_re = re.compile(
+            r"^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"]\s*;?\s*$"
+        )
+        require_default_re = re.compile(
+            r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)\s*;?\s*$"
+        )
+        require_named_re = re.compile(
+            r"^\s*(?:const|let|var)\s+\{([^}]+)\}\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)\s*;?\s*$"
+        )
+        new_assign_re = re.compile(
+            r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\("
+        )
+
+        for relative_path in js_ts_files:
+            absolute_path = self._resolve_file_path(relative_path)
+            if absolute_path is None or not absolute_path.is_file():
+                continue
+            try:
+                source = absolute_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            import_default: dict[str, str] = {}
+            import_namespace: dict[str, str] = {}
+            import_named: dict[str, str] = {}
+            require_default: dict[str, str] = {}
+            require_named: dict[str, str] = {}
+            var_types: dict[str, str] = {}
+
+            for line in source.splitlines():
+                from_match = import_from_re.match(line)
+                if from_match:
+                    clause = from_match.group(1).strip()
+                    module_path = from_match.group(2).strip()
+                    self._parse_js_ts_import_clause(
+                        clause=clause,
+                        module_path=module_path,
+                        import_default=import_default,
+                        import_namespace=import_namespace,
+                        import_named=import_named,
+                    )
+                    continue
+
+                req_default_match = require_default_re.match(line)
+                if req_default_match:
+                    alias = req_default_match.group(1).strip()
+                    module_path = req_default_match.group(2).strip()
+                    require_default[alias] = module_path
+                    continue
+
+                req_named_match = require_named_re.match(line)
+                if req_named_match:
+                    members = req_named_match.group(1)
+                    module_path = req_named_match.group(2).strip()
+                    for member_spec in members.split(","):
+                        cleaned = member_spec.strip()
+                        if not cleaned:
+                            continue
+                        if ":" in cleaned:
+                            left, right = cleaned.split(":", 1)
+                            imported_name = left.strip()
+                            alias = right.strip()
+                        else:
+                            imported_name = cleaned
+                            alias = cleaned
+                        if alias and imported_name:
+                            require_named[alias] = f"{module_path}.{imported_name}"
+                    continue
+
+                for new_match in new_assign_re.finditer(line):
+                    variable_name = new_match.group(1).strip()
+                    class_name = new_match.group(2).strip()
+                    if variable_name and class_name:
+                        var_types[variable_name] = class_name
+
+            self._js_ts_hints_by_file[relative_path] = _JsTsFileHints(
+                import_default=import_default,
+                import_namespace=import_namespace,
+                import_named=import_named,
+                require_default=require_default,
+                require_named=require_named,
+                var_types=var_types,
+            )
+
+    def _parse_js_ts_import_clause(
+        self,
+        *,
+        clause: str,
+        module_path: str,
+        import_default: dict[str, str],
+        import_namespace: dict[str, str],
+        import_named: dict[str, str],
+    ) -> None:
+        if clause.startswith("* as "):
+            alias = clause[len("* as ") :].strip()
+            if alias:
+                import_namespace[alias] = module_path
+            return
+
+        if clause.startswith("{") and clause.endswith("}"):
+            self._parse_js_ts_named_imports(
+                members_blob=clause[1:-1],
+                module_path=module_path,
+                import_named=import_named,
+            )
+            return
+
+        if "," in clause:
+            left, right = clause.split(",", 1)
+            default_alias = left.strip()
+            if default_alias:
+                import_default[default_alias] = module_path
+
+            right = right.strip()
+            if right.startswith("{") and right.endswith("}"):
+                self._parse_js_ts_named_imports(
+                    members_blob=right[1:-1],
+                    module_path=module_path,
+                    import_named=import_named,
+                )
+            elif right.startswith("* as "):
+                alias = right[len("* as ") :].strip()
+                if alias:
+                    import_namespace[alias] = module_path
+            return
+
+        default_alias = clause.strip()
+        if default_alias:
+            import_default[default_alias] = module_path
+
+    @staticmethod
+    def _parse_js_ts_named_imports(
+        *,
+        members_blob: str,
+        module_path: str,
+        import_named: dict[str, str],
+    ) -> None:
+        for member_spec in members_blob.split(","):
+            cleaned = member_spec.strip()
+            if not cleaned:
+                continue
+            if " as " in cleaned:
+                imported_name, alias = cleaned.split(" as ", 1)
+            else:
+                imported_name = cleaned
+                alias = cleaned
+            imported_name = imported_name.strip()
+            alias = alias.strip()
+            if alias and imported_name:
+                import_named[alias] = f"{module_path}.{imported_name}"
+
     def _infer_var_types(
         self, function_node: ast.FunctionDef | ast.AsyncFunctionDef, aliases: dict[str, str]
     ) -> dict[str, str]:
@@ -736,6 +933,181 @@ class SymbolResolver:
         )
         return chosen
 
+    def _resolve_js_ts_dotted_with_var_type(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if not dependency.file.endswith((".js", ".jsx", ".ts", ".tsx")):
+            return None
+        target = dependency.target_symbol
+        if "." not in target:
+            return None
+        receiver, member = target.split(".", 1)
+        if not receiver or not member:
+            return None
+
+        hints = self._js_ts_hints_by_file.get(dependency.file)
+        if hints is None:
+            return None
+        receiver_type = hints.var_types.get(receiver)
+        if not receiver_type:
+            return None
+
+        class_candidates = [
+            s for s in self._by_name.get(receiver_type, []) if s.kind in {"class", "interface"}
+        ]
+        if not class_candidates:
+            return None
+
+        method_candidates = self._by_name.get(member, [])
+        filtered = [
+            method
+            for method in method_candidates
+            if method.parent in {cls.symbol_id for cls in class_candidates}
+        ]
+        if not filtered:
+            return None
+        chosen, _ = self._pick_candidate(filtered, dependency, source_symbol, "js_ts_var_type")
+        return chosen
+
+    def _resolve_js_ts_dotted_with_import_alias(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if not dependency.file.endswith((".js", ".jsx", ".ts", ".tsx")):
+            return None
+        target = dependency.target_symbol
+        if "." not in target:
+            return None
+        receiver, member = target.split(".", 1)
+        if not receiver or not member:
+            return None
+
+        hints = self._js_ts_hints_by_file.get(dependency.file)
+        if hints is None:
+            return None
+
+        module_path = (
+            hints.import_namespace.get(receiver)
+            or hints.import_default.get(receiver)
+            or hints.require_default.get(receiver)
+        )
+        if not module_path:
+            return None
+
+        member_candidates = self._by_name.get(member, [])
+        filtered = [
+            symbol
+            for symbol in member_candidates
+            if _js_import_matches_symbol(
+                import_path=module_path,
+                source_file=dependency.file,
+                symbol_file=symbol.file,
+            )
+        ]
+        if not filtered:
+            return None
+        chosen, _ = self._pick_candidate(
+            filtered, dependency, source_symbol, "js_ts_import_dotted"
+        )
+        return chosen
+
+    def _resolve_js_ts_direct_import_symbol(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if not dependency.file.endswith((".js", ".jsx", ".ts", ".tsx")):
+            return None
+        target = dependency.target_symbol
+        if "." in target:
+            return None
+        hints = self._js_ts_hints_by_file.get(dependency.file)
+        if hints is None:
+            return None
+
+        alias_target = hints.import_named.get(target) or hints.require_named.get(target)
+        if alias_target:
+            module_path, member = alias_target.rsplit(".", 1)
+            member_candidates = self._by_name.get(member, [])
+            filtered = [
+                symbol
+                for symbol in member_candidates
+                if _js_import_matches_symbol(
+                    import_path=module_path,
+                    source_file=dependency.file,
+                    symbol_file=symbol.file,
+                )
+            ]
+            if filtered:
+                chosen, _ = self._pick_candidate(
+                    filtered, dependency, source_symbol, "js_ts_import_direct"
+                )
+                return chosen
+
+        module_path = hints.import_default.get(target) or hints.require_default.get(target)
+        if module_path:
+            default_candidates = [
+                symbol
+                for symbol in self._by_name.get(target, [])
+                if _js_import_matches_symbol(
+                    import_path=module_path,
+                    source_file=dependency.file,
+                    symbol_file=symbol.file,
+                )
+            ]
+            if default_candidates:
+                chosen, _ = self._pick_candidate(
+                    default_candidates, dependency, source_symbol, "js_ts_default_alias"
+                )
+                return chosen
+        return None
+
+    def _resolve_js_ts_import_target(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> Symbol | None:
+        if dependency.kind != "imports":
+            return None
+        if not dependency.file.endswith((".js", ".jsx", ".ts", ".tsx")):
+            return None
+
+        import_path = dependency.target_symbol
+        if not import_path:
+            return None
+
+        file_matched_symbols: list[Symbol] = [
+            symbol
+            for symbol in self._symbols
+            if _js_import_matches_symbol(
+                import_path=import_path,
+                source_file=dependency.file,
+                symbol_file=symbol.file,
+            )
+        ]
+        if not file_matched_symbols:
+            return None
+
+        preferred = [
+            symbol
+            for symbol in file_matched_symbols
+            if symbol.parent is None and symbol.kind in {"class", "function", "interface", "enum"}
+        ]
+        if not preferred:
+            preferred = [symbol for symbol in file_matched_symbols if symbol.parent is None]
+        if not preferred:
+            preferred = file_matched_symbols
+
+        preferred.sort(key=lambda s: (s.file, s.start_line))
+        return preferred[0]
+
 
 def _python_module_from_path(path: str) -> str:
     normalized = path.replace("\\", "/").strip("/")
@@ -820,3 +1192,73 @@ def _java_symbol_fqn(symbol: Symbol, by_id: dict[str, Symbol]) -> str:
     if not package_name:
         return class_name
     return f"{package_name}.{class_name}"
+
+
+def _js_import_matches_symbol(import_path: str, source_file: str, symbol_file: str) -> bool:
+    normalized_symbol_file = symbol_file.replace("\\", "/").strip("/")
+    if not normalized_symbol_file:
+        return False
+
+    candidates = _js_import_file_candidates(import_path, source_file)
+    if normalized_symbol_file in candidates:
+        return True
+
+    # Bare imports fallback: suffix match against module path.
+    if not import_path.startswith("."):
+        module_name = _js_ts_module_from_path(normalized_symbol_file)
+        if module_name:
+            normalized_import = import_path.replace("\\", "/").strip("/")
+            if module_name == normalized_import or module_name.endswith(f".{normalized_import}"):
+                return True
+    return False
+
+
+def _js_import_file_candidates(import_path: str, source_file: str) -> set[str]:
+    normalized_source = source_file.replace("\\", "/").strip("/")
+    source_dir = Path(normalized_source).parent
+    normalized_import = import_path.replace("\\", "/").strip()
+
+    candidates: set[str] = set()
+    if not normalized_import:
+        return candidates
+
+    if normalized_import.startswith("."):
+        base = (source_dir / normalized_import).as_posix().replace("\\", "/")
+        base = str(Path(base))
+        base = base.lstrip("/")
+        raw_bases = [base]
+    else:
+        raw_bases = [normalized_import.lstrip("/")]
+
+    for raw_base in raw_bases:
+        base_no_ext = re.sub(r"\.(js|jsx|ts|tsx|mjs|cjs)$", "", raw_base)
+        for ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            candidates.add(f"{base_no_ext}{ext}")
+        candidates.add(f"{base_no_ext}/index.js")
+        candidates.add(f"{base_no_ext}/index.jsx")
+        candidates.add(f"{base_no_ext}/index.ts")
+        candidates.add(f"{base_no_ext}/index.tsx")
+        candidates.add(base_no_ext)
+    return {candidate.replace("//", "/").strip("/") for candidate in candidates}
+
+
+def _js_ts_module_from_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+    parts = normalized.split("/")
+    if not parts:
+        return ""
+
+    # Drop common source roots.
+    if parts[0] in {"src", "lib", "app"}:
+        parts = parts[1:]
+    if not parts:
+        return ""
+
+    filename = parts[-1]
+    if filename.startswith("index.") and len(parts) > 1:
+        parts = parts[:-1]
+    else:
+        parts[-1] = re.sub(r"\.(js|jsx|ts|tsx|mjs|cjs)$", "", filename)
+    return ".".join(part for part in parts if part)

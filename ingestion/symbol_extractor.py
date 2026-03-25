@@ -56,7 +56,7 @@ class BaseLanguageSymbolExtractor:
         while stack:
             node, parent_id = stack.pop()
             current_parent_id = parent_id
-            symbol_kind = self.SYMBOL_NODE_KIND.get(node.type)
+            symbol_kind = self._symbol_kind_for_node(node, source_bytes)
             if symbol_kind is not None:
                 symbol_name = self._extract_name(node, source_bytes)
                 if symbol_name:
@@ -90,6 +90,10 @@ class BaseLanguageSymbolExtractor:
                 stack.append((child, current_parent_id))
 
         return out
+
+    def _symbol_kind_for_node(self, node: Node, source_bytes: bytes) -> str | None:
+        del source_bytes
+        return self.SYMBOL_NODE_KIND.get(node.type)
 
     def _extract_name(self, node: Node, source_bytes: bytes) -> str | None:
         for field_name in self.NAME_FIELD_CANDIDATES:
@@ -165,6 +169,43 @@ class JavaSymbolExtractor(BaseLanguageSymbolExtractor):
     }
 
 
+class JavaScriptSymbolExtractor(BaseLanguageSymbolExtractor):
+    SYMBOL_NODE_KIND = {
+        "class_declaration": "class",
+        "function_declaration": "function",
+        "method_definition": "method",
+        "generator_function_declaration": "function",
+        "variable_declarator": "function",
+    }
+
+    def _symbol_kind_for_node(self, node: Node, source_bytes: bytes) -> str | None:
+        if node.type != "variable_declarator":
+            return super()._symbol_kind_for_node(node, source_bytes)
+
+        value_node = node.child_by_field_name("value")
+        if value_node is None:
+            return None
+        if value_node.type in {
+            "arrow_function",
+            "function",
+            "function_expression",
+            "generator_function",
+            "generator_function_declaration",
+        }:
+            return "function"
+        return None
+
+
+class TypeScriptSymbolExtractor(JavaScriptSymbolExtractor):
+    SYMBOL_NODE_KIND = {
+        **JavaScriptSymbolExtractor.SYMBOL_NODE_KIND,
+        "interface_declaration": "interface",
+        "type_alias_declaration": "type_alias",
+        "enum_declaration": "enum",
+        "abstract_class_declaration": "class",
+    }
+
+
 class SymbolExtractor:
     def __init__(self) -> None:
         self._extractors: dict[str, BaseLanguageSymbolExtractor] = {
@@ -172,6 +213,8 @@ class SymbolExtractor:
             "c": CppSymbolExtractor(),
             "python": PythonSymbolExtractor(),
             "java": JavaSymbolExtractor(),
+            "javascript": JavaScriptSymbolExtractor(),
+            "typescript": TypeScriptSymbolExtractor(),
         }
 
     def register_extractor(
