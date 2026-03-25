@@ -75,7 +75,33 @@ class SymbolResolver:
         self._build_js_ts_hints()
 
     def resolve_many(self, dependencies: Iterable[Dependency]) -> list[ResolvedDependency]:
-        return [self.resolve(dependency) for dependency in dependencies]
+        out: list[ResolvedDependency] = []
+        for dependency in dependencies:
+            if dependency.kind == "imports" and dependency.file.endswith(
+                (".js", ".jsx", ".ts", ".tsx")
+            ):
+                source_symbol = self._resolve_source_symbol(dependency)
+                targets = self._resolve_js_ts_import_targets(
+                    dependency=dependency,
+                    source_symbol=source_symbol,
+                )
+                if targets:
+                    for target in targets:
+                        out.append(
+                            ResolvedDependency(
+                                source_symbol=dependency.source_symbol,
+                                target_symbol=dependency.target_symbol,
+                                kind=dependency.kind,
+                                file=dependency.file,
+                                line=dependency.line,
+                                source_symbol_id=source_symbol.symbol_id if source_symbol else None,
+                                target_symbol_id=target.symbol_id,
+                                resolution_reason="js_ts_import_multi",
+                            )
+                        )
+                    continue
+            out.append(self.resolve(dependency))
+        return out
 
     def resolve(self, dependency: Dependency) -> ResolvedDependency:
         source_symbol = self._resolve_source_symbol(dependency)
@@ -1095,18 +1121,186 @@ class SymbolResolver:
         if not file_matched_symbols:
             return None
 
-        preferred = [
-            symbol
-            for symbol in file_matched_symbols
-            if symbol.parent is None and symbol.kind in {"class", "function", "interface", "enum"}
-        ]
-        if not preferred:
-            preferred = [symbol for symbol in file_matched_symbols if symbol.parent is None]
-        if not preferred:
-            preferred = file_matched_symbols
+        hints = self._js_ts_hints_by_file.get(dependency.file)
+        requested_names = self._js_ts_requested_import_names(
+            hints=hints,
+            import_path=import_path,
+        )
+        ranked = sorted(
+            file_matched_symbols,
+            key=lambda symbol: self._js_ts_import_anchor_sort_key(
+                symbol=symbol,
+                requested_names=requested_names,
+            ),
+        )
+        return ranked[0] if ranked else None
 
-        preferred.sort(key=lambda s: (s.file, s.start_line))
-        return preferred[0]
+    def _resolve_js_ts_import_targets(
+        self,
+        *,
+        dependency: Dependency,
+        source_symbol: Symbol | None,
+    ) -> list[Symbol]:
+        del source_symbol
+        if dependency.kind != "imports":
+            return []
+        if not dependency.file.endswith((".js", ".jsx", ".ts", ".tsx")):
+            return []
+
+        import_path = dependency.target_symbol
+        if not import_path:
+            return []
+
+        file_matched_symbols: list[Symbol] = [
+            symbol
+            for symbol in self._symbols
+            if _js_import_matches_symbol(
+                import_path=import_path,
+                source_file=dependency.file,
+                symbol_file=symbol.file,
+            )
+        ]
+        if not file_matched_symbols:
+            return []
+
+        hints = self._js_ts_hints_by_file.get(dependency.file)
+        requested_members = self._js_ts_requested_named_members(
+            hints=hints,
+            import_path=import_path,
+        )
+        if requested_members:
+            selected: list[Symbol] = []
+            seen: set[str] = set()
+            by_name: dict[str, list[Symbol]] = defaultdict(list)
+            for symbol in file_matched_symbols:
+                by_name[symbol.name].append(symbol)
+
+            for member_name in requested_members:
+                member_candidates = by_name.get(member_name, [])
+                if not member_candidates:
+                    continue
+                ranked = sorted(
+                    member_candidates,
+                    key=lambda symbol: self._js_ts_import_anchor_sort_key(
+                        symbol=symbol,
+                        requested_names=[member_name],
+                    ),
+                )
+                chosen = ranked[0]
+                if chosen.symbol_id in seen:
+                    continue
+                seen.add(chosen.symbol_id)
+                selected.append(chosen)
+            if selected:
+                return selected
+
+        anchor = self._resolve_js_ts_import_target(
+            dependency=dependency,
+            source_symbol=None,
+        )
+        return [anchor] if anchor is not None else []
+
+    @staticmethod
+    def _js_ts_requested_import_names(
+        *,
+        hints: _JsTsFileHints | None,
+        import_path: str,
+    ) -> list[str]:
+        if hints is None:
+            return []
+        normalized_target = _normalize_js_import_spec(import_path)
+        out: list[str] = []
+
+        for alias, target in hints.import_named.items():
+            if "." not in target:
+                continue
+            module_path, member = target.rsplit(".", 1)
+            if _normalize_js_import_spec(module_path) == normalized_target and member:
+                out.append(member)
+
+        for alias, target in hints.require_named.items():
+            if "." not in target:
+                continue
+            module_path, member = target.rsplit(".", 1)
+            if _normalize_js_import_spec(module_path) == normalized_target and member:
+                out.append(member)
+
+        for alias, module_path in hints.import_default.items():
+            if _normalize_js_import_spec(module_path) == normalized_target and alias:
+                out.append(alias)
+
+        for alias, module_path in hints.require_default.items():
+            if _normalize_js_import_spec(module_path) == normalized_target and alias:
+                out.append(alias)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for name in out:
+            if name in seen:
+                continue
+            seen.add(name)
+            deduped.append(name)
+        return deduped
+
+    @staticmethod
+    def _js_ts_requested_named_members(
+        *,
+        hints: _JsTsFileHints | None,
+        import_path: str,
+    ) -> list[str]:
+        if hints is None:
+            return []
+        normalized_target = _normalize_js_import_spec(import_path)
+        out: list[str] = []
+        for alias, target in hints.import_named.items():
+            if "." not in target:
+                continue
+            module_path, member = target.rsplit(".", 1)
+            if _normalize_js_import_spec(module_path) == normalized_target and member:
+                out.append(member)
+        for alias, target in hints.require_named.items():
+            if "." not in target:
+                continue
+            module_path, member = target.rsplit(".", 1)
+            if _normalize_js_import_spec(module_path) == normalized_target and member:
+                out.append(member)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for name in out:
+            if name in seen:
+                continue
+            seen.add(name)
+            deduped.append(name)
+        return deduped
+
+    def _js_ts_import_anchor_sort_key(
+        self,
+        *,
+        symbol: Symbol,
+        requested_names: list[str],
+    ) -> tuple[int, int, int, int]:
+        requested_name_score = 0
+        if symbol.name in requested_names:
+            requested_name_score = -100
+
+        top_level_score = 0 if symbol.parent is None else 1
+
+        kind_rank = {
+            "class": 0,
+            "function": 1,
+            "interface": 2,
+            "enum": 3,
+            "type_alias": 4,
+            "method": 5,
+        }.get(symbol.kind, 9)
+
+        file_stem = Path(symbol.file).stem
+        stem_rank = 1
+        if symbol.name == file_stem or symbol.name.lower() == file_stem.lower():
+            stem_rank = 0
+
+        return (requested_name_score, top_level_score, kind_rank, stem_rank)
 
 
 def _python_module_from_path(path: str) -> str:
@@ -1262,3 +1456,12 @@ def _js_ts_module_from_path(path: str) -> str:
     else:
         parts[-1] = re.sub(r"\.(js|jsx|ts|tsx|mjs|cjs)$", "", filename)
     return ".".join(part for part in parts if part)
+
+
+def _normalize_js_import_spec(spec: str) -> str:
+    normalized = spec.replace("\\", "/").strip()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\.(js|jsx|ts|tsx|mjs|cjs)$", "", normalized)
+    normalized = re.sub(r"/index$", "", normalized)
+    return normalized.strip("/")
