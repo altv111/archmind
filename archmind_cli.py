@@ -265,7 +265,7 @@ def _add_ask_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--source",
         default="archmind",
-        choices=["archmind", "ollama", "ollamal", "gemini", "openai"],
+        choices=["archmind", "ollama", "ollamal", "gemini", "gemma", "openai"],
         help="Answer source: heuristic-only archmind mode, or Ollama-backed answer generation.",
     )
     parser.add_argument(
@@ -322,7 +322,7 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--source",
         default="ollama",
-        choices=["ollama", "ollamal", "gemini", "openai"],
+        choices=["ollama", "ollamal", "gemini", "gemma", "openai"],
         help="LLM source for agent loop.",
     )
     parser.add_argument("--model", default="llama3:8b", help="LLM model name.")
@@ -1611,6 +1611,28 @@ def _build_llm(source: str, model: str, host: str, timeout: int, api_key: str | 
             api_key=api_key,
             host=resolved_host,
             timeout=timeout,
+        )
+    if source == "gemma":
+        try:
+            from llm.gemma_client import GemmaLLM
+        except ModuleNotFoundError:
+            import importlib.util
+            import sys
+
+            module_path = Path(__file__).resolve().parent / "llm" / "gemma_client.py"
+            spec = importlib.util.spec_from_file_location("gemma_client", module_path)
+            if spec is None or spec.loader is None:
+                raise
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["gemma_client"] = module
+            spec.loader.exec_module(module)
+            GemmaLLM = module.GemmaLLM
+
+        return GemmaLLM(
+            model=model,
+            timeout=timeout,
+            host=host,
+            api_key=api_key,
         )
     if source == "openai":
         try:
