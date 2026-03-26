@@ -314,6 +314,12 @@ def _add_ask_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--base", default="main", help="Default PR base ref for pr_review mode.")
     parser.add_argument("--head", default="HEAD", help="Default PR head ref for pr_review mode.")
     parser.add_argument(
+        "--pr-review-strategy",
+        default="classic",
+        choices=["classic", "windowed"],
+        help="PR review strategy: `classic` keeps current flow, `windowed` runs per-symbol deep review windows.",
+    )
+    parser.add_argument(
         "--source",
         default="ollama",
         choices=["ollama", "ollamal", "gemini", "openai"],
@@ -1531,6 +1537,7 @@ def run_ask_agent(args: argparse.Namespace) -> None:
             pr_base=args.base,
             pr_head=args.head,
             pr_repo_root=args.repo_root or ".",
+            pr_review_strategy=args.pr_review_strategy,
         ),
         on_event=_on_agent_event,
     )

@@ -21,6 +21,26 @@ class AgentConfig:
     pr_base: str = "main"
     pr_head: str = "HEAD"
     pr_repo_root: str = "."
+    pr_review_strategy: str = "classic"  # classic | windowed
+
+
+# PR review tuning knobs (internal, experimentation-friendly)
+PR_REVIEW_FULL_CTX_DEPTH = 3  # `pr_diff_context` graph traversal depth for full context pull.
+PR_REVIEW_FULL_CTX_TOP_SYMBOL_CONTEXTS = 8  # Number of top symbol contexts fetched in full PR context.
+PR_REVIEW_FULL_CTX_TOP_MODULE_CONTEXTS = 4  # Number of top module contexts fetched in full PR context.
+PR_REVIEW_STAGE1_DIFF_MAX_CHARS = 16000  # Maximum raw git diff chars sent to stage-1 PR reviewer prompt.
+PR_REVIEW_STAGE1_TOUCHED_SYMBOLS_LIMIT = 40  # Maximum touched symbols included in stage-1 prompt context.
+PR_REVIEW_STAGE2_SYMBOL_IMPACTS_LIMIT = 8  # Number of highest-risk symbol impacts considered for stage-2.
+PR_REVIEW_STAGE2_ANALYZE_SYMBOLS_LIMIT = 6  # Number of symbols deeply analyzed in stage-2.
+PR_REVIEW_STAGE2_EXCERPT_MAX_LINES_CLASSIC = 60  # Source excerpt lines per symbol in classic stage-2.
+PR_REVIEW_STAGE2_EXCERPT_MAX_LINES_WINDOWED = 80  # Source excerpt lines per symbol in windowed stage-2.
+PR_REVIEW_STAGE2_WINDOW_SNIPPET_CONTEXT_BEFORE = 8  # Lines shown before each changed-line range in windowed snippets.
+PR_REVIEW_STAGE2_WINDOW_SNIPPET_CONTEXT_AFTER = 8  # Lines shown after each changed-line range in windowed snippets.
+PR_REVIEW_STAGE2_WINDOW_MAX_SNIPPETS = 8  # Max changed-line snippets per symbol window.
+PR_REVIEW_STAGE2_WINDOW_MAX_TOTAL_CHARS = 5000  # Max total chars across changed-line snippets per symbol window.
+PR_REVIEW_STAGE3_PROPAGATION_SYMBOLS_LIMIT = 3  # Max propagation symbols promoted from stage-1/2 into stage-3.
+PR_REVIEW_STAGE3_CALL_GRAPH_FANOUT = 5  # Max callers/callees fetched per propagation symbol.
+PR_REVIEW_STAGE3_EXCERPT_MAX_LINES = 30  # Source excerpt lines for caller/callee snippets in stage-3.
 
 
 class AskAgent:
@@ -532,10 +552,14 @@ class AskAgent:
         pr_args: dict[str, Any],
         pr_summary: dict[str, Any],
     ) -> dict[str, Any] | None:
+        strategy = str(getattr(self.config, "pr_review_strategy", "classic") or "classic").lower().strip()
+        if strategy == "windowed":
+            return self._run_pr_llm_review_windowed(pr_args=pr_args, pr_summary=pr_summary)
+
         base = str(pr_args.get("base", self.config.pr_base))
         head = str(pr_args.get("head", self.config.pr_head))
         repo_root = str(pr_args.get("repo_root", self.config.pr_repo_root))
-        depth = int(pr_args.get("depth", 3))
+        depth = int(pr_args.get("depth", PR_REVIEW_FULL_CTX_DEPTH))
 
         try:
             full_ctx = self.executor.execute(
@@ -546,8 +570,8 @@ class AskAgent:
                     "repo_root": repo_root,
                     "depth": depth,
                     "format": "full",
-                    "top_symbol_contexts": 8,
-                    "top_module_contexts": 4,
+                    "top_symbol_contexts": PR_REVIEW_FULL_CTX_TOP_SYMBOL_CONTEXTS,
+                    "top_module_contexts": PR_REVIEW_FULL_CTX_TOP_MODULE_CONTEXTS,
                 },
             ).get("result", {})
         except Exception as exc:  # pragma: no cover - runtime/error dependent
@@ -557,7 +581,12 @@ class AskAgent:
                 "error": str(exc),
             }
 
-        changed_hunks = _git_changed_hunks(repo_root=repo_root, base=base, head=head, max_chars=16000)
+        changed_hunks = _git_changed_hunks(
+            repo_root=repo_root,
+            base=base,
+            head=head,
+            max_chars=PR_REVIEW_STAGE1_DIFF_MAX_CHARS,
+        )
         stage1_prompt = (
             "You are reviewing a PR for obvious defects.\n"
             "Given changed hunks and touched symbols, return strict JSON only:\n"
@@ -570,7 +599,7 @@ class AskAgent:
             "- inferred_from_context: inferred from nearby code or usage context.\n"
             "- generic_risk: general caution not tied to concrete diff evidence.\n\n"
             f"Changed hunks:\n{changed_hunks}\n\n"
-            f"Touched symbols:\n{json.dumps(full_ctx.get('touched_symbols', [])[:40], indent=2)}\n"
+            f"Touched symbols:\n{json.dumps(full_ctx.get('touched_symbols', [])[:PR_REVIEW_STAGE1_TOUCHED_SYMBOLS_LIMIT], indent=2)}\n"
         )
         stage1_raw = self.llm.generate(prompt=stage1_prompt, temperature=0.0, timeout=self.config.timeout)
         stage1 = _parse_json(stage1_raw)
@@ -578,16 +607,16 @@ class AskAgent:
         symbol_impacts = full_ctx.get("symbol_impacts", [])
         top_symbols = []
         if isinstance(symbol_impacts, list):
-            top_symbols = symbol_impacts[:8]
+            top_symbols = symbol_impacts[:PR_REVIEW_STAGE2_SYMBOL_IMPACTS_LIMIT]
         changed_function_excerpts: list[dict[str, Any]] = []
-        for row in top_symbols[:6]:
+        for row in top_symbols[:PR_REVIEW_STAGE2_ANALYZE_SYMBOLS_LIMIT]:
             symbol = row.get("symbol", {}) if isinstance(row, dict) else {}
             symbol_id = symbol.get("symbol_id") if isinstance(symbol, dict) else None
             if not isinstance(symbol_id, str):
                 continue
             try:
                 excerpt = self.executor.execute(
-                    "get_source_excerpt", {"symbol": symbol_id, "max_lines": 60}
+                    "get_source_excerpt", {"symbol": symbol_id, "max_lines": PR_REVIEW_STAGE2_EXCERPT_MAX_LINES_CLASSIC}
                 ).get("result")
             except Exception:
                 excerpt = None
@@ -636,10 +665,10 @@ class AskAgent:
         for symbol_id in propagation_symbols:
             callers = self.executor.execute(
                 "dependents", {"symbol": symbol_id, "kind": "calls"}
-            ).get("result", [])[:5]
+            ).get("result", [])[:PR_REVIEW_STAGE3_CALL_GRAPH_FANOUT]
             callees = self.executor.execute(
                 "dependencies", {"symbol": symbol_id, "kind": "calls"}
-            ).get("result", [])[:5]
+            ).get("result", [])[:PR_REVIEW_STAGE3_CALL_GRAPH_FANOUT]
 
             caller_excerpts = []
             for caller in callers:
@@ -647,7 +676,7 @@ class AskAgent:
                 if not isinstance(caller_id, str):
                     continue
                 excerpt = self.executor.execute(
-                    "get_source_excerpt", {"symbol": caller_id, "max_lines": 30}
+                    "get_source_excerpt", {"symbol": caller_id, "max_lines": PR_REVIEW_STAGE3_EXCERPT_MAX_LINES}
                 ).get("result")
                 caller_excerpts.append({"symbol_id": caller_id, "source_excerpt": excerpt})
 
@@ -657,7 +686,7 @@ class AskAgent:
                 if not isinstance(callee_id, str):
                     continue
                 excerpt = self.executor.execute(
-                    "get_source_excerpt", {"symbol": callee_id, "max_lines": 30}
+                    "get_source_excerpt", {"symbol": callee_id, "max_lines": PR_REVIEW_STAGE3_EXCERPT_MAX_LINES}
                 ).get("result")
                 callee_excerpts.append({"symbol_id": callee_id, "source_excerpt": excerpt})
 
@@ -691,6 +720,239 @@ class AskAgent:
             "head": head,
             "repo_root": str(Path(repo_root).resolve()),
             "summary": pr_summary.get("summary", {}),
+            "stage1": stage1,
+            "stage2": stage2,
+            "stage3": stage3,
+        }
+
+    def _run_pr_llm_review_windowed(
+        self,
+        *,
+        pr_args: dict[str, Any],
+        pr_summary: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        base = str(pr_args.get("base", self.config.pr_base))
+        head = str(pr_args.get("head", self.config.pr_head))
+        repo_root = str(pr_args.get("repo_root", self.config.pr_repo_root))
+        depth = int(pr_args.get("depth", PR_REVIEW_FULL_CTX_DEPTH))
+
+        try:
+            full_ctx = self.executor.execute(
+                "pr_diff_context",
+                {
+                    "base": base,
+                    "head": head,
+                    "repo_root": repo_root,
+                    "depth": depth,
+                    "format": "full",
+                    "top_symbol_contexts": PR_REVIEW_FULL_CTX_TOP_SYMBOL_CONTEXTS,
+                    "top_module_contexts": PR_REVIEW_FULL_CTX_TOP_MODULE_CONTEXTS,
+                },
+            ).get("result", {})
+        except Exception as exc:  # pragma: no cover - runtime/error dependent
+            return {
+                "status": "error",
+                "stage": "full_context",
+                "error": str(exc),
+            }
+
+        changed_hunks = _git_changed_hunks(
+            repo_root=repo_root,
+            base=base,
+            head=head,
+            max_chars=PR_REVIEW_STAGE1_DIFF_MAX_CHARS,
+        )
+        stage1_prompt = (
+            "You are reviewing a PR for obvious defects.\n"
+            "Given changed hunks and touched symbols, return strict JSON only:\n"
+            '{"local_findings":[{"severity":"low|medium|high","kind":"obvious_bug|type_mismatch|logic_risk|style","file":"...","line":0,"why":"...",'
+            '"evidence_class":"confirmed_by_diff|inferred_from_context|generic_risk"}],'
+            '"propagation_candidates":[{"symbol_id":"...","reason":"signature_or_contract_change|behavior_change|serialization_change"}],'
+            '"notes":"..."}\n\n'
+            "Classification rules:\n"
+            "- confirmed_by_diff: directly visible in changed lines (signature/type/default/return mismatch).\n"
+            "- inferred_from_context: inferred from nearby code or usage context.\n"
+            "- generic_risk: general caution not tied to concrete diff evidence.\n\n"
+            f"Changed hunks:\n{changed_hunks}\n\n"
+            f"Touched symbols:\n{json.dumps(full_ctx.get('touched_symbols', [])[:PR_REVIEW_STAGE1_TOUCHED_SYMBOLS_LIMIT], indent=2)}\n"
+        )
+        stage1_raw = self.llm.generate(prompt=stage1_prompt, temperature=0.0, timeout=self.config.timeout)
+        stage1 = _parse_json(stage1_raw)
+
+        symbol_impacts = full_ctx.get("symbol_impacts", [])
+        top_symbols: list[dict[str, Any]] = []
+        if isinstance(symbol_impacts, list):
+            top_symbols = [
+                row for row in symbol_impacts if isinstance(row, dict)
+            ][:PR_REVIEW_STAGE2_SYMBOL_IMPACTS_LIMIT]
+
+        changed_lines = _git_changed_lines(repo_root=repo_root, base=base, head=head)
+        windows: list[dict[str, Any]] = []
+        merged_findings: list[dict[str, Any]] = []
+        merged_propagation: list[dict[str, Any]] = []
+
+        for row in top_symbols[:PR_REVIEW_STAGE2_ANALYZE_SYMBOLS_LIMIT]:
+            symbol = row.get("symbol", {})
+            if not isinstance(symbol, dict):
+                continue
+            symbol_id = symbol.get("symbol_id")
+            if not isinstance(symbol_id, str):
+                continue
+            file_path = symbol.get("file")
+            start_line = symbol.get("start_line")
+            end_line = symbol.get("end_line")
+
+            try:
+                excerpt = self.executor.execute(
+                    "get_source_excerpt", {"symbol": symbol_id, "max_lines": PR_REVIEW_STAGE2_EXCERPT_MAX_LINES_WINDOWED}
+                ).get("result")
+            except Exception:
+                excerpt = None
+
+            changed_in_symbol: list[int] = []
+            changed_snippets: list[dict[str, Any]] = []
+            if (
+                isinstance(file_path, str)
+                and isinstance(start_line, int)
+                and isinstance(end_line, int)
+            ):
+                lines_in_file = changed_lines.get(file_path, set())
+                changed_in_symbol = sorted(
+                    line for line in lines_in_file if start_line <= line <= end_line
+                )
+                changed_snippets = _symbol_changed_line_snippets(
+                    repo_root=repo_root,
+                    file_path=file_path,
+                    symbol_start=start_line,
+                    symbol_end=end_line,
+                    changed_lines=changed_in_symbol,
+                    context_before=PR_REVIEW_STAGE2_WINDOW_SNIPPET_CONTEXT_BEFORE,
+                    context_after=PR_REVIEW_STAGE2_WINDOW_SNIPPET_CONTEXT_AFTER,
+                    max_snippets=PR_REVIEW_STAGE2_WINDOW_MAX_SNIPPETS,
+                    max_total_chars=PR_REVIEW_STAGE2_WINDOW_MAX_TOTAL_CHARS,
+                )
+
+            window_prompt = (
+                "You are doing deep PR review on ONE changed symbol window.\n"
+                "Return strict JSON only:\n"
+                '{"function_findings":[{"symbol_id":"...","severity":"low|medium|high","defect":"...","confidence":"low|medium|high",'
+                '"evidence_class":"confirmed_by_diff|inferred_from_context|generic_risk"}],'
+                '"propagation_needed":[{"symbol_id":"...","why":"..."}]}\n\n'
+                "Rules:\n"
+                "- Prioritize changed_line_snippets over generic concerns.\n"
+                "- If changed_line_snippets is empty, reduce confidence and say why.\n"
+                "- confirmed_by_diff only when defect is explicit in snippets.\n\n"
+                f"Stage1 local findings (context):\n{json.dumps(stage1.get('local_findings', []), indent=2)}\n\n"
+                f"Symbol window:\n{json.dumps({'symbol_id': symbol_id, 'risk_score': row.get('risk_score'), 'summary': row.get('summary'), 'source_excerpt': excerpt, 'changed_lines_in_symbol': changed_in_symbol, 'changed_line_snippets': changed_snippets}, indent=2)}\n"
+            )
+            window_raw = self.llm.generate(prompt=window_prompt, temperature=0.0, timeout=self.config.timeout)
+            window_result = _parse_json(window_raw)
+
+            function_findings = window_result.get("function_findings")
+            if isinstance(function_findings, list):
+                for finding in function_findings:
+                    if isinstance(finding, dict):
+                        merged_findings.append(finding)
+            propagation_needed = window_result.get("propagation_needed")
+            if isinstance(propagation_needed, list):
+                for item in propagation_needed:
+                    if isinstance(item, dict) and isinstance(item.get("symbol_id"), str):
+                        merged_propagation.append(item)
+
+            windows.append(
+                {
+                    "symbol_id": symbol_id,
+                    "risk_score": row.get("risk_score"),
+                    "changed_lines_in_symbol": len(changed_in_symbol),
+                    "changed_line_ranges": _line_ranges(changed_in_symbol),
+                    "window_result": window_result,
+                }
+            )
+
+        stage2 = {
+            "strategy": "windowed",
+            "windows": windows,
+            "function_findings": merged_findings,
+            "propagation_needed": merged_propagation,
+        }
+
+        propagation_candidates = []
+        for source in (stage1.get("propagation_candidates"), stage2.get("propagation_needed")):
+            if isinstance(source, list):
+                for item in source:
+                    if isinstance(item, dict) and isinstance(item.get("symbol_id"), str):
+                        propagation_candidates.append(item)
+        seen_symbols: set[str] = set()
+        propagation_symbols: list[str] = []
+        for item in propagation_candidates:
+            symbol_id = str(item.get("symbol_id"))
+            if symbol_id in seen_symbols:
+                continue
+            seen_symbols.add(symbol_id)
+            propagation_symbols.append(symbol_id)
+            if len(propagation_symbols) >= PR_REVIEW_STAGE3_PROPAGATION_SYMBOLS_LIMIT:
+                break
+
+        stage3_context: list[dict[str, Any]] = []
+        for symbol_id in propagation_symbols:
+            callers = self.executor.execute(
+                "dependents", {"symbol": symbol_id, "kind": "calls"}
+            ).get("result", [])[:PR_REVIEW_STAGE3_CALL_GRAPH_FANOUT]
+            callees = self.executor.execute(
+                "dependencies", {"symbol": symbol_id, "kind": "calls"}
+            ).get("result", [])[:PR_REVIEW_STAGE3_CALL_GRAPH_FANOUT]
+
+            caller_excerpts = []
+            for caller in callers:
+                caller_id = caller.get("symbol_id") if isinstance(caller, dict) else None
+                if not isinstance(caller_id, str):
+                    continue
+                excerpt = self.executor.execute(
+                    "get_source_excerpt", {"symbol": caller_id, "max_lines": PR_REVIEW_STAGE3_EXCERPT_MAX_LINES}
+                ).get("result")
+                caller_excerpts.append({"symbol_id": caller_id, "source_excerpt": excerpt})
+
+            callee_excerpts = []
+            for callee in callees:
+                callee_id = callee.get("symbol_id") if isinstance(callee, dict) else None
+                if not isinstance(callee_id, str):
+                    continue
+                excerpt = self.executor.execute(
+                    "get_source_excerpt", {"symbol": callee_id, "max_lines": PR_REVIEW_STAGE3_EXCERPT_MAX_LINES}
+                ).get("result")
+                callee_excerpts.append({"symbol_id": callee_id, "source_excerpt": excerpt})
+
+            stage3_context.append(
+                {
+                    "symbol_id": symbol_id,
+                    "callers": caller_excerpts,
+                    "callees": callee_excerpts,
+                }
+            )
+
+        stage3 = {}
+        if stage3_context:
+            stage3_prompt = (
+                "You are doing integration breakage review.\n"
+                "Return strict JSON only:\n"
+                '{"integration_findings":[{"symbol_id":"...","severity":"low|medium|high","kind":"signature_mismatch|behavioral_break|compat_risk","evidence":"...","confidence":"low|medium|high",'
+                '"evidence_class":"confirmed_by_diff|inferred_from_context|generic_risk"}]}\n\n'
+                "Classification rules:\n"
+                "- confirmed_by_diff: caller/callee snippets show direct mismatch or breakage.\n"
+                "- inferred_from_context: likely integration defect inferred from context.\n"
+                "- generic_risk: broad integration caution.\n\n"
+                f"Propagation contexts:\n{json.dumps(stage3_context, indent=2)}\n"
+            )
+            stage3_raw = self.llm.generate(prompt=stage3_prompt, temperature=0.0, timeout=self.config.timeout)
+            stage3 = _parse_json(stage3_raw)
+
+        return {
+            "status": "ok",
+            "base": base,
+            "head": head,
+            "repo_root": str(Path(repo_root).resolve()),
+            "summary": pr_summary.get("summary", {}),
+            "strategy": "windowed",
             "stage1": stage1,
             "stage2": stage2,
             "stage3": stage3,
@@ -1066,6 +1328,129 @@ def _git_changed_hunks(
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3] + "..."
+
+
+def _git_changed_lines(*, repo_root: str, base: str, head: str) -> dict[str, set[int]]:
+    cmd = [
+        "git",
+        "-C",
+        str(Path(repo_root).resolve()),
+        "diff",
+        "--unified=0",
+        "--no-color",
+        f"{base}...{head}",
+    ]
+    try:
+        diff_text = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except Exception:
+        return {}
+
+    changed: dict[str, set[int]] = {}
+    current_file: str | None = None
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            raw = line[4:].strip()
+            if raw == "/dev/null":
+                current_file = None
+            elif raw.startswith("b/"):
+                current_file = raw[2:]
+            else:
+                current_file = raw
+            continue
+        if current_file is None:
+            continue
+        match = hunk_re.match(line)
+        if not match:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+        lines = changed.setdefault(current_file, set())
+        if count <= 0:
+            lines.add(start)
+            continue
+        for lineno in range(start, start + count):
+            lines.add(lineno)
+    return changed
+
+
+def _symbol_changed_line_snippets(
+    *,
+    repo_root: str,
+    file_path: str,
+    symbol_start: int,
+    symbol_end: int,
+    changed_lines: list[int],
+    context_before: int = 8,
+    context_after: int = 8,
+    max_snippets: int = 10,
+    max_total_chars: int = 8000,
+) -> list[dict[str, Any]]:
+    if not changed_lines:
+        return []
+    lines = _read_file_lines(repo_root=repo_root, file_path=file_path)
+    if not lines:
+        return []
+
+    ranges = _line_ranges(changed_lines)
+    snippets: list[dict[str, Any]] = []
+    consumed = 0
+    for range_start, range_end in ranges:
+        if len(snippets) >= max_snippets:
+            break
+        excerpt_start = max(symbol_start, range_start - context_before)
+        excerpt_end = min(symbol_end, range_end + context_after)
+        if excerpt_start > excerpt_end:
+            continue
+        slice_start_idx = max(excerpt_start - 1, 0)
+        slice_end_idx = min(excerpt_end, len(lines))
+        excerpt_lines = lines[slice_start_idx:slice_end_idx]
+        text = "\n".join(excerpt_lines).strip()
+        if not text:
+            continue
+        remaining = max_total_chars - consumed
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            text = text[: max(0, remaining - 3)] + "..."
+        snippet_changed = [line for line in changed_lines if range_start <= line <= range_end]
+        snippets.append(
+            {
+                "start_line": excerpt_start,
+                "end_line": excerpt_end,
+                "changed_lines": snippet_changed,
+                "text": text,
+            }
+        )
+        consumed += len(text)
+    return snippets
+
+
+def _read_file_lines(*, repo_root: str, file_path: str) -> list[str]:
+    try:
+        path = (Path(repo_root).resolve() / file_path).resolve()
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    return text.splitlines()
+
+
+def _line_ranges(lines: list[int]) -> list[tuple[int, int]]:
+    if not lines:
+        return []
+    sorted_lines = sorted(set(lines))
+    out: list[tuple[int, int]] = []
+    start = sorted_lines[0]
+    prev = sorted_lines[0]
+    for current in sorted_lines[1:]:
+        if current == prev + 1:
+            prev = current
+            continue
+        out.append((start, prev))
+        start = current
+        prev = current
+    out.append((start, prev))
+    return out
 
 
 def _quality_recovery_tool_call(
